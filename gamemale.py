@@ -215,41 +215,56 @@ class Gamemale:
         url = f"https://{self.hostname}/plugin.php?id=viewui_draw&mod=api&ac=adddraw"
         base64_img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADklEQVR4AWL6////fwAAAAD//w7I1cwAAAAGSURBVAMACgUD/9k79a8AAAAASUVORK5CYII="
         data = {'title': '水果', 'answer': '苹果', 'pic': base64_img}
-        headers = {'x-requested-with': 'XMLHttpRequest', 'referer': f"https://{self.hostname}/plugin.php?id=viewui_draw&mod=list&ac=draw"}
+        headers = {
+            'x-requested-with': 'XMLHttpRequest', 
+            'referer': f"https://{self.hostname}/plugin.php?id=viewui_draw&mod=list&ac=draw"
+        }
         try:
             res = self.session.post(url, data=data, headers=headers).text
+            self.task_logger.info(f"[Debug] 你画我猜服务器返回: {res[:50]}")
+            
             if "成功" in res or "succeed" in res or "200" in res:
                 return "出题成功"
-            elif "今日" in res:
+            elif "今日" in res or "上限" in res or "次" in res:
                 return "额度已满"
-        except:
-            pass
-        return "提交失败"
+            else:
+                return f"失败: {res[:10]}"
+        except Exception as e:
+            return "提交异常"
 
     def fetch_assets(self):
         self.task_logger.info("正在获取实时个人资产数据...")
-        url = f"https://{self.hostname}/home.php?mod=spacecp&ac=credit&op=base"
+        credit_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=credit&op=base"
+        forum_url = f"https://{self.hostname}/forum.php"
         try:
-            res = self.session.get(url).text
-            asset_items = re.findall(r'<li><em>(.*?)[:-]\s*</em>(.*?)<\/li>', res)
-            if asset_items:
-                clean_assets = []
-                for name, value in asset_items:
-                    # 使用正则剥离残留的 HTML 标签，只保留纯文本
-                    clean_name = re.sub(r'<[^>]+>', '', name).strip()
-                    clean_value = re.sub(r'<[^>]+>', '', value).strip()
-                    if clean_name:
-                        clean_assets.append(f"- {clean_name}: {clean_value}")
-                self.assets_report = "\n".join(clean_assets)
-            else:
-                clean_text = re.sub(r'<[^>]+>', '', res)
-                matches = re.findall(r'(金币|血液|旅程|追随|知识|咒术|堕落|灵魂)\s*[:：]?\s*(\d+)', clean_text)
-                if matches:
-                    self.assets_report = "\n".join([f"- {k}: {v}" for k, v in matches])
-                else:
-                    self.assets_report = "无法解析资产页面结构"
+            credit_res = self.session.get(credit_url).text
+            forum_res = self.session.get(forum_url).text
+            
+            gold_match = re.search(r'金币\s*[:：]\s*(\d+)', forum_res) or re.search(r'金币\s*[:：]\s*(\d+)', credit_res)
+            current_gold = int(gold_match.group(1)) if gold_match else 0
+            
+            last_gold = current_gold
+            if os.path.exists("gold_record.txt"):
+                with open("gold_record.txt", "r") as f:
+                    content = f.read().strip()
+                    if content.isdigit():
+                        last_gold = int(content)
+            
+            growth = current_gold - last_gold
+            growth_str = f"+{growth}" if growth >= 0 else str(growth)
+            
+            with open("gold_record.txt", "w") as f:
+                f.write(str(current_gold))
+                
+            self.assets_report = f"- 金币: {current_gold} (较昨日: {growth_str})"
+            
+            clean_text = re.sub(r'<[^>]+>', '', credit_res)
+            matches = re.findall(r'(血液|旅程|追随|知识|咒术|堕落|灵魂)\s*[:：]?\s*(\d+)', clean_text)
+            if matches:
+                self.assets_report += "\n" + "\n".join([f"- {k}: {v}" for k, v in matches])
         except Exception as e:
             self.assets_report = f"资产抓取异常: {e}"
+            
         self.task_logger.info(f"当前账户资产状况:\n{self.assets_report}")
 
     def execute_interactive_tasks(self):
