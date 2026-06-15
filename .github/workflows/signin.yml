@@ -2,7 +2,8 @@ name: 'GameMale Auto Sign-in'
 
 on:
   schedule:
-    - cron: '0 1,13 * * *' # 每天北京时间 09:00 和 21:00 自动运行
+    - cron: '5 16 * * *' # 每天北京时间 00:05 自动运行
+    - cron: '0 7 * * *'  # 每天北京时间 15:00 自动运行
   workflow_dispatch: # 必须保留：允许在 GitHub 界面手动点击运行测试
 
 jobs:
@@ -22,8 +23,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests ddddocr
 
-          # 补充说明：ddddocr 依赖较重，在 Ubuntu 虚拟机中初次安装需要大约 10-14 秒
-
       - name: Run Task Script
         env:
           USERNAME: ${{ secrets.USERNAME }}
@@ -34,3 +33,15 @@ jobs:
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python gamemale.py
+
+      # 【新增】跑完脚本后，自动把最新的金币记录文件保存回你的仓库中，用于明天的金币对比
+      - name: Commit Asset Record
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 如果脚本生成了数据文件，就将其添加到 Git 缓存中
+          if [ -f gold_record.txt ]; then
+            git add gold_record.txt
+            git commit -m "chore: 自动更新每日金币对比基准文件" || echo "今天金币没有任何变化，跳过本次保存"
+            git push
+          fi
