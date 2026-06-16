@@ -1,5 +1,8 @@
 # GM-All-In-One Gamemale论坛签到一条龙
 
+<img width="2752" height="1536" alt="banner" src="https://github.com/user-attachments/assets/67b7061a-144d-4a4c-bfd1-d550ea9bf19d" />
+
+
 这是一个用于 GameMale 论坛的纯后台自动化挂机脚本。
 配置好之后，它每天会定时帮你完成签到、抽奖、互动等全部日常，并把当天的签到情况与资产变动排版成邮件发给你。
 
