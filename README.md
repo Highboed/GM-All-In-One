@@ -1,7 +1,7 @@
-<img width="2460" height="1122" alt="屏幕截图 2026-06-16 205446" src="https://github.com/user-attachments/assets/9cf5b840-8901-49f6-8cc6-f393b2ba6550" /># GM-All-In-One
+# GM-All-In-One Gamemale论坛签到一条龙
 
 这是一个用于 GameMale 论坛的纯后台自动化挂机脚本。
-配置好之后，它每天会定时帮你完成签到、抽奖、互动等全部日常，并把当天的资产变动（尤其是金币的增减）排版成邮件发给你。
+配置好之后，它每天会定时帮你完成签到、抽奖、互动等全部日常，并把当天的签到情况与资产变动排版成邮件发给你。
 
 ---
 
@@ -12,12 +12,17 @@
 ### 第一步：Fork 并隐藏仓库（极其重要）
 1. 点击本页面右上角的 **Fork**，把项目复制到你自己的 GitHub 账号下。
 2. ⚠️ **保护隐私**：Fork 完成后，立刻进入你仓库的 `Settings` -> 左侧选 `General` -> 滑到页面最底部的 `Danger Zone`，点击 **Change visibility**，将仓库改为 **Private（私有）**。
+<img width="2460" height="1122" alt="屏幕截图 2026-06-16 205446" src="https://github.com/user-attachments/assets/9cf5b840-8901-49f6-8cc6-f393b2ba6550" /># GM-All-In-One
+<img width="1688" height="1078" alt="image" src="https://github.com/user-attachments/assets/97624d5b-60fb-4c7c-9a8f-e78f20e536a2" />
+
 
 ### 第二步：获取发件邮箱授权码
 为了让脚本能给你发战报，你需要一个发件邮箱（比如 QQ 邮箱）。
 1. 登录 QQ 邮箱网页版，进入 `设置` -> `账号`。
 2. 往下翻找到 `POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV服务`。
 3. 开启 **SMTP 服务**，点击“生成授权码”，把弹出的那一串十多位的字母密码**复制保存下来**（不要告诉别人）。
+<img width="2088" height="1056" alt="image" src="https://github.com/user-attachments/assets/ffe595b2-392e-4d17-8723-c80242cc7621" />
+
 
 ### 第三步：填入账号密码配置
 回到你的 GitHub 仓库页面，进入 `Settings` -> 左侧找 `Secrets and variables` -> 点 `Actions`。
