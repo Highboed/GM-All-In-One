@@ -299,19 +299,21 @@ class Gamemale:
         self.task_logger.info(f"互动作业结果: {self.task_result}")
 
     def send_notification(self):
-        smtp_host = "smtp.qq.com"  
-        smtp_port = 465  
+        # 恢复通过 GitHub Secrets 读取发件服务器，保持高兼容性
+        smtp_host = os.getenv("SMTP_HOST")  
+        smtp_port = 465  # 绝大多数邮箱的 SSL 端口都是 465，直接写死即可
         
         mail_user = os.getenv("MAIL_USER")
         mail_pass = os.getenv("MAIL_PASS")
         
-        # 【终极修复】应对 GitHub Actions 传空字符串的坑
+        # 应对 GitHub Actions 传空字符串的坑
         mail_to = os.getenv("MAIL_TO")
         if not mail_to or mail_to.strip() == "":
             mail_to = mail_user
             
-        if not all([mail_user, mail_pass]):
-            self.notice_logger.warning("未配置完整的发件人邮箱或授权码，跳过邮件通知流程")
+        # 增加对 smtp_host 的非空检测
+        if not all([smtp_host, mail_user, mail_pass]):
+            self.notice_logger.warning("未配置完整的 SMTP_HOST、发件人邮箱或授权码，跳过邮件通知流程")
             return
             
         self.notice_logger.info(f"正在发送推送邮件至: {mail_to} ...")
