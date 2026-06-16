@@ -45,7 +45,8 @@
 1. 进入 `Settings` -> 左侧选 `Actions` -> 点 `General`。
 2. 滑到最底部的 `Workflow permissions`，选中 **Read and write permissions**。
 3. 点击 **Save** 保存。
-![Uploading image.png…]()
+![Uploading 屏幕截图 2026-06-16 211315.png…]()
+
 
 
 ### 第五步：一键激活运行
