@@ -45,7 +45,7 @@
 1. 进入 `Settings` -> 左侧选 `Actions` -> 点 `General`。
 2. 滑到最底部的 `Workflow permissions`，选中 **Read and write permissions**。
 3. 点击 **Save** 保存。
-![Uploading 屏幕截图 2026-06-16 211315.png…]()
+<img width="2109" height="1763" alt="屏幕截图 2026-06-16 211315" src="https://github.com/user-attachments/assets/a9234e3d-f50f-4a43-9256-0833c6fad419" />
 
 
 
