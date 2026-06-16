@@ -12,7 +12,6 @@
 ### 第一步：Fork 并隐藏仓库（极其重要）
 1. 点击本页面右上角的 **Fork**，把项目复制到你自己的 GitHub 账号下。
 2. ⚠️ **保护隐私**：Fork 完成后，立刻进入你仓库的 `Settings` -> 左侧选 `General` -> 滑到页面最底部的 `Danger Zone`，点击 **Change visibility**，将仓库改为 **Private（私有）**。
-<img width="1688" height="1078" alt="image" src="https://github.com/user-attachments/assets/97624d5b-60fb-4c7c-9a8f-e78f20e536a2" />
 
 
 ### 第二步：获取发件邮箱授权码
