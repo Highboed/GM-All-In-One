@@ -14,7 +14,7 @@
 
 ### 第一步：Import 项目并设置为私有（⚠️ 保护账号隐私的关键）
 
-登录 GitHub，点击页面右上角的 + 号图标，在下拉菜单中选择 Import repository（导入仓库）。
+登录 GitHub，点击页面右上角的 + 号图标，在下拉菜单中选择 Import repository（导入仓库）。\N
 在第一栏 Your old repository’s clone URL 中，填入本项目的地址：
 `https://github.com/Highboed/GM-All-In-One`
 在 Repository name 这一栏，为你的仓库起个名字（比如 GM-Auto）。
