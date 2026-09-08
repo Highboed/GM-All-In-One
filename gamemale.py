@@ -1,7 +1,5 @@
 import logging
-# 【修改 1】：注释掉原有的 requests，替换为 curl_cffi，伪装真实浏览器指纹穿透 CF 盾
-# import requests
-from curl_cffi import requests
+import requests
 import re
 import ddddocr
 import os
@@ -10,6 +8,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
+from DrissionPage import ChromiumPage, ChromiumOptions
 
 def setup_logger(name, verbose=False):
     logger = logging.getLogger(name)
@@ -48,9 +47,7 @@ class Gamemale:
         self.questionid = questionid
         self.answer = str(answer) if answer else ""
         self.hostname = "www.gamemale.com"
-        
-        # 【修改 2】：使用带有 impersonate 参数的 Session，底层模拟 Chrome 120 的网络特征
-        self.session = requests.Session(impersonate="chrome120")
+        self.session = requests.session()
         self.session.headers.update({
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -58,6 +55,39 @@ class Gamemale:
                 'Chrome/120.0.0.0 Safari/537.36'
             )
         })
+
+    def bypass_cloudflare(self):
+        self.main_logger.info("启动真实 Chrome 浏览器，准备突破 Cloudflare 盾...")
+        co = ChromiumOptions()
+        # 针对 GitHub Actions 无头服务器环境的强制配置
+        co.set_argument('--headless=new')
+        co.set_argument('--no-sandbox')
+        co.set_argument('--disable-gpu')
+        co.set_argument('--disable-dev-shm-usage')
+        
+        page = ChromiumPage(co)
+        try:
+            # 访问主页触发 CF 盾
+            page.get(f"https://{self.hostname}/forum.php")
+            self.main_logger.info("正在等待 CF 盾验证通过 (约需 5-10 秒)...")
+            
+            # 等待网页标题不再是拦截页特征
+            page.wait.title_changes('Just a moment...', timeout=20)
+            time.sleep(3) # 额外缓冲，确保 Cookie 写入完毕
+            
+            # 提取通过验证的真实 Cookie 和 User-Agent
+            cookies = page.cookies(as_dict=True)
+            ua = page.user_agent
+            
+            # 将破盾凭证移交给原本的 requests session
+            self.session.cookies.update(cookies)
+            self.session.headers.update({'User-Agent': ua})
+            
+            self.main_logger.info("🔥 Cloudflare 盾破解成功！已安全接管底层会话。")
+        except Exception as e:
+            self.main_logger.error(f"破盾异常: {e}")
+        finally:
+            page.quit() # 释放浏览器内存
 
     def get_login_formhash(self):
         url = f"https://{self.hostname}/member.php?mod=logging&action=login"
@@ -195,7 +225,7 @@ class Gamemale:
         return count
 
     def stance_blogs(self):
-        count, page = 0, 1
+        count, page = 1, 1
         while count < 10 and page <= 3:
             list_url = f"https://{self.hostname}/home.php?mod=space&do=blog&view=all&catid=14&page={page}"
             try:
@@ -342,6 +372,7 @@ class Gamemale:
             
     def run(self):
         self.main_logger.info("=== GM-All-In-One 任务引擎启动 ===")
+        self.bypass_cloudflare() # 强制在登录前破盾
         if not self.login():
             return
         self.sign_gamemale()
