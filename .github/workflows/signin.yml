@@ -2,9 +2,9 @@ name: 'GameMale Auto Sign-in'
 
 on:
   schedule:
-    - cron: '17 16 * * *'
-    - cron: '43 6 * * *'
-  workflow_dispatch:
+    - cron: '17 16 * * *' # 每天北京时间 00:17 自动运行
+    - cron: '43 6 * * *'  # 每天北京时间 14:43 自动运行
+  workflow_dispatch: # 允许在 GitHub 界面手动运行测试
 
 jobs:
   signin:
