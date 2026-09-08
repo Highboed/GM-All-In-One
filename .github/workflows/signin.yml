@@ -1,3 +1,4 @@
+```yaml
 name: 'GameMale Auto Sign-in'
 
 on:
@@ -21,7 +22,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests ddddocr
+          pip install requests ddddocr DrissionPage
 
       - name: Run Task Script
         env:
@@ -33,14 +34,16 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python gamemale.py
 
-      # 【新增】跑完脚本后，自动把最新的金币记录文件保存回你的仓库中，用于明天的金币对比
+      # 跑完脚本后，自动把最新的金币记录文件保存回你的仓库中，用于明天的金币对比
       - name: Commit Asset Record
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           # 如果脚本生成了数据文件，就将其添加到 Git 缓存中
           if [ -f gold_record.txt ]; then
             git add gold_record.txt
             git commit -m "chore: 自动更新每日金币对比基准文件" || echo "今天金币没有任何变化，跳过本次保存"
             git push
           fi
+```
