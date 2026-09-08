@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '17 16 * * *' # 每天北京时间 00:17 自动运行
     - cron: '43 6 * * *'  # 每天北京时间 14:43 自动运行
-  workflow_dispatch: # 允许在 GitHub 界面手动运行测试
+  workflow_dispatch:
 
 jobs:
   signin:
@@ -24,6 +24,40 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests ddddocr DrissionPage
 
+      - name: Start Chrome
+        run: |
+          google-chrome \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-dev-shm-usage \
+            --disable-software-rasterizer \
+            --disable-background-networking \
+            --disable-background-timer-throttling \
+            --disable-renderer-backgrounding \
+            --disable-features=Translate,BackForwardCache \
+            --remote-debugging-address=127.0.0.1 \
+            --remote-debugging-port=9222 \
+            --user-data-dir=/tmp/gm-chrome \
+            > /tmp/chrome.log 2>&1 &
+
+          echo "等待 Chrome DevTools 启动..."
+
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:9222/json/version > /dev/null; then
+              echo "Chrome DevTools 启动成功"
+              curl -s http://127.0.0.1:9222/json/version
+              break
+            fi
+            sleep 1
+          done
+
+          if ! curl -s http://127.0.0.1:9222/json/version > /dev/null; then
+            echo "Chrome 启动失败"
+            cat /tmp/chrome.log
+            exit 1
+          fi
+
       - name: Run Task Script
         env:
           USERNAME: ${{ secrets.USERNAME }}
@@ -32,9 +66,12 @@ jobs:
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: python gamemale.py
+          CHROME_DEBUG_ADDRESS: 127.0.0.1:9222
+        run: |
+          python gamemale.py
 
       - name: Commit Asset Record
+        if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -44,3 +81,9 @@ jobs:
             git commit -m "chore: 自动更新每日金币对比基准文件" || echo "今天金币没有任何变化，跳过本次保存"
             git push
           fi
+
+      - name: Chrome Log
+        if: failure()
+        run: |
+          echo "===== Chrome Log ====="
+          cat /tmp/chrome.log || true
