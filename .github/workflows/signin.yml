@@ -1,15 +1,15 @@
-```yaml
 name: 'GameMale Auto Sign-in'
 
 on:
   schedule:
-    - cron: '17 16 * * *' # 每天北京时间 00:17 自动运行
-    - cron: '43 6 * * *'  # 每天北京时间 14:43 自动运行
-  workflow_dispatch: # 必须保留：允许在 GitHub 界面手动点击运行测试
+    - cron: '17 16 * * *'
+    - cron: '43 6 * * *'
+  workflow_dispatch:
 
 jobs:
   signin:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
@@ -34,16 +34,13 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python gamemale.py
 
-      # 跑完脚本后，自动把最新的金币记录文件保存回你的仓库中，用于明天的金币对比
       - name: Commit Asset Record
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 如果脚本生成了数据文件，就将其添加到 Git 缓存中
           if [ -f gold_record.txt ]; then
             git add gold_record.txt
             git commit -m "chore: 自动更新每日金币对比基准文件" || echo "今天金币没有任何变化，跳过本次保存"
             git push
           fi
-```
