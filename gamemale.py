@@ -8,7 +8,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
-from DrissionPage import Chromium, ChromiumOptions
+from DrissionPage import ChromiumPage, ChromiumOptions
 
 
 def setup_logger(name, verbose=False):
@@ -25,6 +25,7 @@ def setup_logger(name, verbose=False):
         '%(asctime)s | %(levelname)-8s | %(name)-10s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
+
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
@@ -32,6 +33,7 @@ def setup_logger(name, verbose=False):
 
 
 class Gamemale:
+
     def __init__(
         self,
         username,
@@ -52,6 +54,7 @@ class Gamemale:
         self.ocr = ddddocr.DdddOcr(show_ad=False)
 
         self.post_formhash = None
+
         self.sign_result = "未执行"
         self.exchange_result = "未执行"
         self.task_result = "未执行"
@@ -59,142 +62,115 @@ class Gamemale:
 
         self.username = str(username)
         self.password = str(password)
-        self.questionid = str(questionid)
+
+        self.questionid = questionid
         self.answer = str(answer) if answer else ""
 
         self.hostname = "www.gamemale.com"
-        self.base_url = f"https://{self.hostname}"
 
-        self.session = requests.Session()
+        self.session = requests.session()
+
         self.session.headers.update({
             'User-Agent': (
-                'Mozilla/5.0 (X11; Linux x86_64) '
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/152.0.0.0 Safari/537.36'
+                'Chrome/120.0.0.0 Safari/537.36'
             )
         })
 
-        self.browser = None
-        self.browser_tab = None
-
-    def _get_chrome_port(self):
-        port = os.getenv("CHROME_REMOTE_DEBUGGING_PORT", "9222")
-
-        try:
-            return int(port)
-        except ValueError:
-            return 9222
-
-    def _chrome_available(self, port):
-        try:
-            response = requests.get(
-                f"http://127.0.0.1:{port}/json/version",
-                timeout=5
-            )
-            return response.ok
-        except Exception:
-            return False
+    # =========================================================
+    # Chrome / Cloudflare
+    # =========================================================
 
     def bypass_cloudflare(self):
         """
-        使用 GitHub Actions 已经启动的 Chrome。
-        不重复启动第二个 Chrome，避免与 workflow 中的 remote debugging
-        浏览器发生冲突。
+        连接 GitHub Actions 已经启动的 Chrome。
+
+        注意：
+        这里不再启动新的 Chrome。
+        GitHub Actions 的 YAML 负责启动 Chrome 并监听 9222。
         """
+
         self.main_logger.info(
             "连接 GitHub Actions 中已经启动的 Chrome，准备访问站点..."
         )
 
-        port = self._get_chrome_port()
-
-        self.main_logger.info(
-            f"尝试连接 Chrome 调试端口: 127.0.0.1:{port}"
+        debug_address = os.getenv(
+            "CHROME_DEBUG_ADDRESS",
+            "127.0.0.1:9222"
         )
 
-        if not self._chrome_available(port):
-            self.main_logger.error(
-                f"Chrome DevTools 调试端口 {port} 不可访问。"
-            )
-            return False
+        self.main_logger.info(
+            f"尝试连接 Chrome 调试端口: {debug_address}"
+        )
+
+        page = None
 
         try:
-            # DrissionPage 4.1.x 推荐通过 Chromium 对象接管已有浏览器。
-            self.browser = Chromium(port)
-            self.browser_tab = self.browser.latest_tab
+            # 关键：
+            # 明确告诉 DrissionPage 使用已经存在的 Chrome
+            co = ChromiumOptions()
+            co.set_address(debug_address)
 
-            if not self.browser_tab:
-                self.main_logger.error("没有找到可用的 Chrome 标签页。")
-                return False
+            page = ChromiumPage(co)
 
-            self.browser_tab.get(
-                f"{self.base_url}/forum.php",
+            self.main_logger.info("Chrome 浏览器连接成功")
+
+            # 访问网站
+            page.get(
+                f"https://{self.hostname}/forum.php",
                 timeout=30
             )
 
             self.main_logger.info(
-                "Chrome 已连接，等待页面完成加载..."
+                "正在等待页面加载 / Cloudflare 验证..."
             )
 
-            # 给页面以及浏览器 Cookie 一定的时间完成写入。
-            deadline = time.time() + 30
-
-            while time.time() < deadline:
-                try:
-                    title = self.browser_tab.title or ""
-                except Exception:
-                    title = ""
-
-                if title and "Just a moment" not in title:
-                    break
-
-                time.sleep(2)
-
-            # 再留出一点页面加载缓冲时间。
-            time.sleep(3)
+            # 等待页面稳定
+            time.sleep(5)
 
             try:
-                cookies = self.browser.cookies().as_dict()
-            except Exception:
-                cookies = {}
-
-            if not cookies:
-                try:
-                    cookies = self.browser_tab.cookies(
-                        all_domains=True
-                    ).as_dict()
-                except Exception:
-                    cookies = {}
-
-            if not cookies:
-                self.main_logger.error(
-                    "Chrome 已连接，但没有读取到浏览器 Cookie。"
+                title = page.title
+                self.main_logger.info(
+                    f"当前页面标题: {title}"
                 )
-                return False
-
-            try:
-                ua = self.browser_tab.user_agent
             except Exception:
-                ua = self.session.headers.get('User-Agent')
+                pass
 
+            # 获取浏览器 Cookie
+            cookies = page.cookies(as_dict=True)
+
+            if not cookies:
+                raise RuntimeError(
+                    "Chrome 已连接，但没有获取到 Cookie"
+                )
+
+            self.main_logger.info(
+                f"成功获取 Chrome Cookie，共 {len(cookies)} 个"
+            )
+
+            # 获取浏览器 UA
+            try:
+                ua = page.user_agent
+
+                if ua:
+                    self.session.headers.update({
+                        'User-Agent': ua
+                    })
+
+                    self.main_logger.info(
+                        f"已同步浏览器 User-Agent"
+                    )
+            except Exception as e:
+                self.main_logger.warning(
+                    f"获取浏览器 User-Agent 失败，继续使用默认 UA: {e}"
+                )
+
+            # Cookie 转移到 requests
             self.session.cookies.update(cookies)
 
-            if ua:
-                self.session.headers.update({
-                    'User-Agent': ua
-                })
-
-            # 确认 requests 会话能够访问站点。
-            check_response = self.session.get(
-                f"{self.base_url}/forum.php",
-                timeout=20
-            )
-
             self.main_logger.info(
-                f"站点访问状态: HTTP {check_response.status_code}"
-            )
-
-            self.main_logger.info(
-                "Chrome 浏览器会话已成功接管。"
+                "🔥 Chrome 浏览器会话已成功接管"
             )
 
             return True
@@ -203,16 +179,34 @@ class Gamemale:
             self.main_logger.error(
                 f"Chrome / 页面处理异常: {e}"
             )
+
+            self.main_logger.error(
+                "Chrome 浏览器会话建立失败，中止本次任务。"
+            )
+
             return False
 
+        finally:
+            # 这里不能 page.quit()
+            #
+            # 因为这个 Chrome 不是 gamemale.py 创建的，
+            # 而是 GitHub Actions 创建的。
+            #
+            # 如果调用 quit，会把 Actions 中的 Chrome 一起关闭。
+            pass
+
+    # =========================================================
+    # Login
+    # =========================================================
+
     def get_login_formhash(self):
+
         url = (
-            f"{self.base_url}/member.php"
-            f"?mod=logging&action=login"
+            f"https://{self.hostname}"
+            f"/member.php?mod=logging&action=login"
         )
 
-        response = self.session.get(url, timeout=20)
-        text = response.text
+        text = self.session.get(url).text
 
         loginhash_match = re.search(
             r'<div id="main_messaqge_(.+?)">',
@@ -235,28 +229,31 @@ class Gamemale:
         )
 
     def verify_code(self, max_retries=10):
+
         self.login_logger.info(
             f"正在识别验证码 [最大重试次数: {max_retries}]"
         )
 
         for attempt in range(1, max_retries + 1):
+
             try:
                 update_url = (
-                    f"{self.base_url}/misc.php"
-                    f"?mod=seccode"
-                    f"&action=update"
-                    f"&idhash=cSA"
-                    f"&0.1234567"
-                    f"&modid=member::logging"
+                    f"https://{self.hostname}"
+                    f"/misc.php?"
+                    f"mod=seccode&"
+                    f"action=update&"
+                    f"idhash=cSA&"
+                    f"0.1234567&"
+                    f"modid=member::logging"
                 )
 
                 update_text = self.session.get(
                     update_url,
-                    timeout=15
+                    timeout=20
                 ).text
 
                 update_match = re.search(
-                    r'update=(.+?)&idhash=',
+                    r"update=(.+?)&idhash=",
                     update_text
                 )
 
@@ -266,64 +263,67 @@ class Gamemale:
                     )
                     continue
 
-                update_value = update_match.group(1)
+                update_id = update_match.group(1)
 
                 code_url = (
-                    f"{self.base_url}/misc.php"
-                    f"?mod=seccode"
-                    f"&update={update_value}"
-                    f"&idhash=cSA"
+                    f"https://{self.hostname}"
+                    f"/misc.php?"
+                    f"mod=seccode&"
+                    f"update={update_id}&"
+                    f"idhash=cSA"
                 )
 
                 headers = {
                     'Accept': (
-                        'image/webp,image/apng,image/*,*/*;q=0.8'
+                        'image/webp,image/apng,image/*,'
+                        '*/*;q=0.8'
                     ),
                     'Referer': (
-                        f"{self.base_url}/member.php"
-                        f"?mod=logging&action=login"
+                        f"https://{self.hostname}"
+                        f"/member.php?mod=logging&action=login"
                     )
                 }
 
                 code_resp = self.session.get(
                     code_url,
                     headers=headers,
-                    timeout=15
+                    timeout=20
                 )
 
                 if not code_resp.content:
-                    self.login_logger.warning(
-                        f"验证码图片为空，第 {attempt} 次"
-                    )
                     continue
 
                 code = self.ocr.classification(
                     code_resp.content
-                ).strip()
+                )
 
-                if not code:
-                    continue
+                self.login_logger.debug(
+                    f"验证码 OCR 结果: {code}"
+                )
 
                 verify_url = (
-                    f"{self.base_url}/misc.php"
-                    f"?mod=seccode"
-                    f"&action=check"
-                    f"&inajax=1"
-                    f"&modid=member::logging"
-                    f"&idhash=cSA"
-                    f"&secverify={code}"
+                    f"https://{self.hostname}"
+                    f"/misc.php?"
+                    f"mod=seccode&"
+                    f"action=check&"
+                    f"inajax=1&"
+                    f"modid=member::logging&"
+                    f"idhash=cSA&"
+                    f"secverify={code}"
                 )
 
-                verify_response = self.session.get(
+                verify_text = self.session.get(
                     verify_url,
-                    timeout=15
-                )
+                    timeout=20
+                ).text
 
-                if "succeed" in verify_response.text:
+                if "succeed" in verify_text:
+
                     self.login_logger.info(
                         f"验证码识别成功: {code} "
                         f"(尝试第 {attempt} 次)"
                     )
+
                     return code
 
             except Exception as e:
@@ -331,12 +331,13 @@ class Gamemale:
                     f"验证码处理异常，第 {attempt} 次: {e}"
                 )
 
-            time.sleep(1)
-
         return ""
 
     def login(self):
-        self.login_logger.info("开始登录流程...")
+
+        self.login_logger.info(
+            "开始登录流程..."
+        )
 
         code = self.verify_code()
 
@@ -348,6 +349,7 @@ class Gamemale:
 
         try:
             loginhash, formhash = self.get_login_formhash()
+
         except Exception as e:
             self.login_logger.error(
                 f"获取登录参数失败: {e}"
@@ -355,17 +357,18 @@ class Gamemale:
             return False
 
         login_url = (
-            f"{self.base_url}/member.php"
-            f"?mod=logging"
-            f"&action=login"
-            f"&loginsubmit=yes"
-            f"&loginhash={loginhash}"
-            f"&inajax=1"
+            f"https://{self.hostname}"
+            f"/member.php?"
+            f"mod=logging&"
+            f"action=login&"
+            f"loginsubmit=yes&"
+            f"loginhash={loginhash}&"
+            f"inajax=1"
         )
 
         form_data = {
             'formhash': formhash,
-            'referer': f"{self.base_url}/",
+            'referer': f"https://{self.hostname}/",
             'loginfield': self.username,
             'username': self.username,
             'password': self.password,
@@ -378,52 +381,11 @@ class Gamemale:
         }
 
         try:
-            response = self.session.post(
+            resp_text = self.session.post(
                 login_url,
                 data=form_data,
-                timeout=20
-            )
-
-            resp_text = response.text
-
-            if "succeed" in resp_text:
-                self.login_logger.info("登录成功")
-
-                try:
-                    forum_response = self.session.get(
-                        f"{self.base_url}/forum.php",
-                        timeout=20
-                    )
-
-                    formhash_match = re.search(
-                        r'<input type="hidden" name="formhash" '
-                        r'value="(.+?)" />',
-                        forum_response.text
-                    )
-
-                    if formhash_match:
-                        self.post_formhash = (
-                            formhash_match.group(1)
-                        )
-                        self.login_logger.info(
-                            "全局 formhash 获取成功"
-                        )
-                    else:
-                        self.login_logger.warning(
-                            "未找到全局 formhash"
-                        )
-
-                except Exception as e:
-                    self.login_logger.error(
-                        f"提取全局 formhash 失败: {e}"
-                    )
-
-                return True
-
-            self.login_logger.error(
-                "登录失败，请检查凭证或安全提问设置"
-            )
-            return False
+                timeout=30
+            ).text
 
         except Exception as e:
             self.login_logger.error(
@@ -431,31 +393,87 @@ class Gamemale:
             )
             return False
 
+        if "succeed" in resp_text:
+
+            self.login_logger.info(
+                "登录成功"
+            )
+
+            try:
+
+                text = self.session.get(
+                    f"https://{self.hostname}/forum.php",
+                    timeout=30
+                ).text
+
+                formhash_match = re.search(
+                    r'<input type="hidden" name="formhash" value="(.+?)" />',
+                    text
+                )
+
+                if formhash_match:
+
+                    self.post_formhash = (
+                        formhash_match.group(1)
+                    )
+
+                    self.login_logger.info(
+                        "成功获取全局 formhash"
+                    )
+
+                else:
+                    self.login_logger.warning(
+                        "登录成功，但未找到全局 formhash"
+                    )
+
+            except Exception as e:
+                self.login_logger.error(
+                    f"提取全局 formhash 失败: {e}"
+                )
+
+            return True
+
+        self.login_logger.error(
+            "登录失败，请检查凭证或安全提问设置"
+        )
+
+        return False
+
+    # =========================================================
+    # Daily Sign
+    # =========================================================
+
     def sign_gamemale(self):
-        self.sign_logger.info("执行每日签到...")
+
+        self.sign_logger.info(
+            "执行每日签到..."
+        )
 
         if not self.post_formhash:
             self.sign_result = "失败：缺少 formhash"
             return
 
         url = (
-            f"{self.base_url}/k_misign-sign.html"
-            f"?operation=qiandao"
-            f"&format=button"
-            f"&formhash={self.post_formhash}"
+            f"https://{self.hostname}"
+            f"/k_misign-sign.html?"
+            f"operation=qiandao&"
+            f"format=button&"
+            f"formhash={self.post_formhash}"
         )
 
         try:
-            response = self.session.get(
-                url,
-                timeout=20
-            )
-            res_text = response.text
 
-            if "签到成功" in res_text:
+            res = self.session.get(
+                url,
+                timeout=30
+            ).text
+
+            if "签到成功" in res:
                 self.sign_result = "签到成功"
-            elif "已签" in res_text:
+
+            elif "已签" in res:
                 self.sign_result = "今日已签到"
+
             else:
                 self.sign_result = "未知响应状态"
 
@@ -464,12 +482,19 @@ class Gamemale:
             )
 
         except Exception as e:
+
             self.sign_result = f"异常: {e}"
+
             self.sign_logger.error(
                 f"签到异常: {e}"
             )
 
+    # =========================================================
+    # Daily Exchange
+    # =========================================================
+
     def daily_exchange(self):
+
         self.exchange_logger.info(
             "执行日常卡片抽奖..."
         )
@@ -478,52 +503,59 @@ class Gamemale:
             self.exchange_result = "失败：缺少 formhash"
             return
 
+        timestamp = str(
+            int(time.time() * 1000)
+        )
+
         url = (
-            f"{self.base_url}/plugin.php"
-            f"?id=it618_award:ajax"
-            f"&ac=getaward"
-            f"&formhash={self.post_formhash}"
-            f"&_={int(time.time() * 1000)}"
+            f"https://{self.hostname}"
+            f"/plugin.php?"
+            f"id=it618_award:ajax&"
+            f"ac=getaward&"
+            f"formhash={self.post_formhash}&"
+            f"_={timestamp}"
         )
 
         headers = {
-            'Accept': (
+            'accept': (
                 'application/json, text/javascript, '
                 '*/*; q=0.01'
             ),
-            'Referer': (
-                f"{self.base_url}/it618_award-award.html"
+            'referer': (
+                f"https://{self.hostname}"
+                f"/it618_award-award.html"
             ),
-            'X-Requested-With': 'XMLHttpRequest',
+            'x-requested-with': 'XMLHttpRequest',
         }
 
         try:
+
             response = self.session.get(
                 url,
                 headers=headers,
-                timeout=20
+                timeout=30
             )
 
-            try:
-                res_json = response.json()
-            except Exception:
-                res_json = {}
+            res_json = response.json()
 
-            if res_json.get("tipname") == "":
+            tipname = res_json.get("tipname")
+
+            if tipname == "":
                 self.exchange_result = (
                     "无奖励（今日或已抽奖）"
                 )
 
-            elif res_json.get("tipname") == "ok":
+            elif tipname == "ok":
+
                 self.exchange_result = (
                     f"抽奖成功: "
                     f"{res_json.get('tipvalue')}"
                 )
 
             else:
+
                 self.exchange_result = (
-                    f"非预期响应: "
-                    f"{res_json.get('tipname')}"
+                    f"非预期响应: {tipname}"
                 )
 
             self.exchange_logger.info(
@@ -531,40 +563,68 @@ class Gamemale:
             )
 
         except Exception as e:
-            self.exchange_result = f"异常: {e}"
+
+            self.exchange_result = (
+                f"异常: {e}"
+            )
+
             self.exchange_logger.error(
                 f"抽奖异常: {e}"
             )
 
+    # =========================================================
+    # Interactive Tasks
+    # =========================================================
+
     def visit_spaces(self):
-        uids = [730713, 62445, 61832]
+
+        uids = [
+            730713,
+            62445,
+            61832
+        ]
+
         count = 0
 
         for uid in uids:
+
             try:
+
                 self.session.get(
-                    f"{self.base_url}/space-uid-{uid}.html",
-                    timeout=15
+                    f"https://{self.hostname}"
+                    f"/space-uid-{uid}.html",
+                    timeout=20
                 )
+
                 count += 1
+
                 time.sleep(1)
+
             except Exception:
                 pass
 
         return count
 
     def poke_users(self):
-        uids = [730713, 62445, 61832]
+
+        uids = [
+            730713,
+            62445,
+            61832
+        ]
+
         count = 0
 
         for uid in uids:
+
             url = (
-                f"{self.base_url}/home.php"
-                f"?mod=spacecp"
-                f"&ac=poke"
-                f"&op=send"
-                f"&uid={uid}"
-                f"&inajax=1"
+                f"https://{self.hostname}"
+                f"/home.php?"
+                f"mod=spacecp&"
+                f"ac=poke&"
+                f"op=send&"
+                f"uid={uid}&"
+                f"inajax=1"
             )
 
             data = {
@@ -575,10 +635,11 @@ class Gamemale:
             }
 
             try:
+
                 response = self.session.post(
                     url,
                     data=data,
-                    timeout=15
+                    timeout=20
                 )
 
                 if "succeed" in response.text:
@@ -592,66 +653,77 @@ class Gamemale:
         return count
 
     def stance_blogs(self):
+
         count = 1
         page = 1
 
         while count < 10 and page <= 3:
+
             list_url = (
-                f"{self.base_url}/home.php"
-                f"?mod=space"
-                f"&do=blog"
-                f"&view=all"
-                f"&catid=14"
-                f"&page={page}"
+                f"https://{self.hostname}"
+                f"/home.php?"
+                f"mod=space&"
+                f"do=blog&"
+                f"view=all&"
+                f"catid=14&"
+                f"page={page}"
             )
 
             try:
-                response = self.session.get(
+
+                res = self.session.get(
                     list_url,
                     timeout=20
-                )
+                ).text
 
                 blog_urls = set(
                     re.findall(
-                        r'home\.php\?mod=space'
+                        r'home\.php\?'
+                        r'mod=space'
                         r'(?:&amp;|&)uid=\d+'
                         r'(?:&amp;|&)do=blog'
                         r'(?:&amp;|&)id=\d+',
-                        response.text
+                        res
                     )
                 )
 
                 for uri in blog_urls:
+
                     if count >= 10:
                         break
 
-                    clean_uri = uri.replace('&amp;', '&')
+                    uri = uri.replace(
+                        '&amp;',
+                        '&'
+                    )
 
                     blog_res = self.session.get(
-                        f"{self.base_url}/{clean_uri}",
+                        f"https://{self.hostname}/{uri}",
                         timeout=20
                     ).text
 
                     click_match = re.search(
-                        r'(home\.php\?mod=spacecp'
+                        r'(home\.php\?'
+                        r'mod=spacecp'
                         r'(?:&amp;|&)ac=click'
                         r'(?:&amp;|&)op=add[^"\']+)',
                         blog_res
                     )
 
                     if click_match:
+
                         click_url = (
-                            f"{self.base_url}/"
+                            f"https://{self.hostname}/"
                             f"{click_match.group(1).replace('&amp;', '&')}"
                         )
 
                         click_res = self.session.get(
                             click_url,
                             headers={
-                                'X-Requested-With':
+                                'x-requested-with':
                                     'XMLHttpRequest'
                             },
-                            timeout=15
+                            timeout=20
                         ).text
 
                         if "成功" in click_res:
@@ -667,18 +739,20 @@ class Gamemale:
         return count
 
     def draw_and_guess(self):
+
         url = (
-            f"{self.base_url}/plugin.php"
-            f"?id=viewui_draw"
-            f"&mod=api"
-            f"&ac=adddraw"
+            f"https://{self.hostname}"
+            f"/plugin.php?"
+            f"id=viewui_draw&"
+            f"mod=api&"
+            f"ac=adddraw"
         )
 
         base64_img = (
             "data:image/png;base64,"
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
-            "AAAADUlEQVR4AWL6////fwAAAAD//w7I1cwAAAAGSURBVAMACgUD/9k79a8"
-            "AAAAASUVORK5CYII="
+            "AAAADklEQVR4AWL6////fwAAAAD//w7I1cwAAAAGSURBVAMACgUD"
+            "/9k79a8AAAAASUVORK5CYII="
         )
 
         data = {
@@ -689,79 +763,93 @@ class Gamemale:
         }
 
         headers = {
-            'X-Requested-With': 'XMLHttpRequest',
-            'Origin': self.base_url,
-            'Referer': (
-                f"{self.base_url}/plugin.php?id=viewui_draw"
+            'x-requested-with': 'XMLHttpRequest',
+            'origin': f"https://{self.hostname}",
+            'referer': (
+                f"https://{self.hostname}"
+                f"/plugin.php?id=viewui_draw"
             )
         }
 
         try:
+
             response = self.session.post(
                 url,
                 data=data,
                 headers=headers,
-                timeout=20
+                timeout=30
             )
 
             try:
+
                 res_json = response.json()
+
                 msg = res_json.get(
                     "message",
-                    response.text[:100]
+                    response.text[:20]
                 )
+
             except Exception:
-                msg = response.text[:100]
+
+                msg = response.text[:20]
 
             self.task_logger.info(
                 f"[Debug] 你画我猜真实返回: {msg}"
             )
 
-            if "成功" in msg or "succeed" in msg:
+            if (
+                "成功" in msg
+                or "succeed" in msg
+            ):
                 return "出题成功"
 
-            if (
+            elif (
                 "今日" in msg
                 or "上限" in msg
                 or "用完" in msg
             ):
                 return "额度已满"
 
-            return f"失败: {msg[:10]}"
+            else:
+                return f"失败: {msg[:10]}"
 
         except Exception as e:
+
             self.task_logger.error(
                 f"你画我猜提交异常: {e}"
             )
+
             return "提交异常"
 
+    # =========================================================
+    # Assets
+    # =========================================================
+
     def fetch_assets(self):
+
         self.task_logger.info(
-            "正在获取实时个人资产数据..."
+            "正在获取实时个人资产数据 (极简稳定版)..."
         )
 
         url = (
-            f"{self.base_url}/home.php"
-            f"?mod=spacecp"
-            f"&ac=credit"
-            f"&op=base"
+            f"https://{self.hostname}"
+            f"/home.php?"
+            f"mod=spacecp&"
+            f"ac=credit&"
+            f"op=base"
         )
 
         try:
-            response = self.session.get(
+
+            res = self.session.get(
                 url,
-                timeout=20
-            )
+                timeout=30
+            ).text
 
             clean_text = re.sub(
                 r'<[^>]+>',
-                ' ',
-                response.text
-            )
-            clean_text = re.sub(
-                r'\s+',
-                ' ',
-                clean_text
+                '',
+                res
             )
 
             assets_dict = {}
@@ -776,6 +864,7 @@ class Gamemale:
                 '堕落',
                 '灵魂'
             ]:
+
                 match = re.search(
                     rf'{item}\s*[:：]?\s*(\d+)',
                     clean_text
@@ -788,38 +877,39 @@ class Gamemale:
                 )
 
             current_gold = assets_dict['金币']
+
             last_gold = current_gold
 
             if os.path.exists("gold_record.txt"):
-                try:
-                    with open(
-                        "gold_record.txt",
-                        "r",
-                        encoding="utf-8"
-                    ) as f:
-                        content = f.read().strip()
+
+                with open(
+                    "gold_record.txt",
+                    "r",
+                    encoding="utf-8"
+                ) as f:
+
+                    content = f.read().strip()
 
                     if content.isdigit():
                         last_gold = int(content)
 
-                except Exception as e:
-                    self.task_logger.warning(
-                        f"读取金币记录失败: {e}"
-                    )
-
             growth = current_gold - last_gold
 
-            if growth >= 0:
-                growth_str = f"+{growth}"
-            else:
-                growth_str = str(growth)
+            growth_str = (
+                f"+{growth}"
+                if growth >= 0
+                else str(growth)
+            )
 
             with open(
                 "gold_record.txt",
                 "w",
                 encoding="utf-8"
             ) as f:
-                f.write(str(current_gold))
+
+                f.write(
+                    str(current_gold)
+                )
 
             report = (
                 f"💰 金币: {current_gold} "
@@ -836,15 +926,22 @@ class Gamemale:
             self.assets_report = report
 
         except Exception as e:
+
             self.assets_report = (
                 f"资产抓取异常: {e}"
             )
 
         self.task_logger.info(
-            f"当前账户综合看板:\n{self.assets_report}"
+            f"当前账户综合看板:\n"
+            f"{self.assets_report}"
         )
 
+    # =========================================================
+    # Execute Tasks
+    # =========================================================
+
     def execute_interactive_tasks(self):
+
         self.task_logger.info(
             "开始执行互动作业..."
         )
@@ -865,15 +962,29 @@ class Gamemale:
             f"互动作业结果: {self.task_result}"
         )
 
+    # =========================================================
+    # Email Notification
+    # =========================================================
+
     def send_notification(self):
-        smtp_host = os.getenv("SMTP_HOST")
-        smtp_port = int(
-            os.getenv("SMTP_PORT", "465")
+
+        smtp_host = os.getenv(
+            "SMTP_HOST"
         )
 
-        mail_user = os.getenv("MAIL_USER")
-        mail_pass = os.getenv("MAIL_PASS")
-        mail_to = os.getenv("MAIL_TO")
+        smtp_port = 465
+
+        mail_user = os.getenv(
+            "MAIL_USER"
+        )
+
+        mail_pass = os.getenv(
+            "MAIL_PASS"
+        )
+
+        mail_to = os.getenv(
+            "MAIL_TO"
+        )
 
         if not mail_to or mail_to.strip() == "":
             mail_to = mail_user
@@ -883,10 +994,13 @@ class Gamemale:
             mail_user,
             mail_pass
         ]):
+
             self.notice_logger.warning(
-                "未配置完整的 SMTP_HOST、发件人邮箱或授权码，"
+                "未配置完整的 SMTP_HOST、"
+                "发件人邮箱或授权码，"
                 "跳过邮件通知流程"
             )
+
             return
 
         self.notice_logger.info(
@@ -895,17 +1009,32 @@ class Gamemale:
 
         mail_content = (
             "<h3>GameMale 每日自动化任务报告</h3>"
-            f"<p><b>核心签到:</b> {self.sign_result}</p>"
-            f"<p><b>日常抽奖:</b> {self.exchange_result}</p>"
-            f"<p><b>互动作业:</b> {self.task_result}</p>"
+
+            f"<p><b>核心签到:</b> "
+            f"{self.sign_result}</p>"
+
+            f"<p><b>日常抽奖:</b> "
+            f"{self.exchange_result}</p>"
+
+            f"<p><b>互动作业:</b> "
+            f"{self.task_result}</p>"
+
             "<br>"
             "<h4>📊 当前核心资产状态：</h4>"
-            "<pre style='background:#f4f4f4;"
-            "padding:15px;border-radius:5px;"
-            "font-family:monospace;line-height:1.6;"
-            "font-size:14px;'>"
+
+            "<pre style='"
+            "background:#f4f4f4;"
+            "padding:15px;"
+            "border-radius:5px;"
+            "font-family:monospace;"
+            "line-height:1.6;"
+            "font-size:14px;"
+            "'>"
+
             f"{self.assets_report}"
+
             "</pre>"
+
             "<br>"
             "<small style='color:#888;'>"
             "报告由 GM-All-In-One 自动化引擎生成"
@@ -920,28 +1049,36 @@ class Gamemale:
 
         message['From'] = formataddr(
             (
-                Header("GM-Bot", 'utf-8').encode(),
+                Header(
+                    "GM-Bot",
+                    'utf-8'
+                ).encode(),
                 mail_user
             )
         )
 
         message['To'] = formataddr(
             (
-                Header("Master", 'utf-8').encode(),
+                Header(
+                    "Master",
+                    'utf-8'
+                ).encode(),
                 mail_to
             )
         )
 
         message['Subject'] = Header(
-            f"GameMale 任务运行报告 - {self.sign_result}",
+            f"GameMale 任务运行报告 - "
+            f"{self.sign_result}",
             'utf-8'
         )
 
         try:
+
             server = smtplib.SMTP_SSL(
                 smtp_host,
-                smtp_port,
-                timeout=20
+                int(smtp_port),
+                timeout=30
             )
 
             server.login(
@@ -962,43 +1099,63 @@ class Gamemale:
             )
 
         except Exception as e:
+
             self.notice_logger.error(
                 f"推送邮件发送失败: {e}"
             )
 
+    # =========================================================
+    # Main
+    # =========================================================
+
     def run(self):
+
         self.main_logger.info(
             "=== GM-All-In-One 任务引擎启动 ==="
         )
 
+        # 连接 Actions 已经启动的 Chrome
         if not self.bypass_cloudflare():
-            self.main_logger.error(
-                "Chrome 浏览器会话建立失败，中止本次任务。"
-            )
-            return False
+            return
 
+        # 登录
         if not self.login():
-            return False
+            return
 
+        # 每日签到
         self.sign_gamemale()
+
+        # 日常抽奖
         self.daily_exchange()
+
+        # 互动任务
         self.execute_interactive_tasks()
+
+        # 获取资产
         self.fetch_assets()
+
+        # 邮件通知
         self.send_notification()
 
         self.main_logger.info(
             "=== 所有作业同步执行完毕 ==="
         )
 
-        return True
-
 
 if __name__ == "__main__":
-    username = os.getenv("USERNAME")
-    password = os.getenv("PASSWORD")
+
+    username = os.getenv(
+        "USERNAME"
+    )
+
+    password = os.getenv(
+        "PASSWORD"
+    )
 
     if not username or not password:
-        print("缺少 USERNAME 或 PASSWORD")
+        print(
+            "缺少 USERNAME 或 PASSWORD 环境变量"
+        )
         raise SystemExit(1)
 
     gm = Gamemale(
@@ -1007,7 +1164,4 @@ if __name__ == "__main__":
         verbose=False
     )
 
-    success = gm.run()
-
-    if not success:
-        raise SystemExit(1)
+    gm.run()
