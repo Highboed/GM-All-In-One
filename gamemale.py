@@ -1,5 +1,7 @@
 import logging
-import requests
+# 【修改 1】：注释掉原有的 requests，替换为 curl_cffi，伪装真实浏览器指纹穿透 CF 盾
+# import requests
+from curl_cffi import requests
 import re
 import ddddocr
 import os
@@ -46,12 +48,14 @@ class Gamemale:
         self.questionid = questionid
         self.answer = str(answer) if answer else ""
         self.hostname = "www.gamemale.com"
-        self.session = requests.session()
+        
+        # 【修改 2】：使用带有 impersonate 参数的 Session，底层模拟 Chrome 120 的网络特征
+        self.session = requests.Session(impersonate="chrome120")
         self.session.headers.update({
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/91.0.4472.124 Safari/537.36'
+                'Chrome/120.0.0.0 Safari/537.36'
             )
         })
 
@@ -215,7 +219,6 @@ class Gamemale:
         url = f"https://{self.hostname}/plugin.php?id=viewui_draw&mod=api&ac=adddraw"
         base64_img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADklEQVR4AWL6////fwAAAAD//w7I1cwAAAAGSURBVAMACgUD/9k79a8AAAAASUVORK5CYII="
         
-        # 【修复来源异常】加上防伪装的 origin 和 formhash
         data = {
             'title': '水果', 
             'answer': '苹果', 
@@ -253,7 +256,6 @@ class Gamemale:
             res = self.session.get(url).text
             clean_text = re.sub(r'<[^>]+>', '', res)
             
-            # 抓取资产
             assets_dict = {}
             for item in ['金币', '血液', '旅程', '追随', '知识', '咒术', '堕落', '灵魂']:
                 match = re.search(f'{item}\\s*[:：]?\\s*(\\d+)', clean_text)
@@ -261,7 +263,6 @@ class Gamemale:
                 
             current_gold = assets_dict['金币']
             
-            # 金币对比
             last_gold = current_gold
             if os.path.exists("gold_record.txt"):
                 with open("gold_record.txt", "r") as f:
@@ -275,7 +276,6 @@ class Gamemale:
             with open("gold_record.txt", "w") as f:
                 f.write(str(current_gold))
                 
-            # 【精简版排版】去掉报错的未知项，只保留硬通货
             report = (
                 f"💰 金币: {current_gold} (较昨日 {growth_str})\n"
                 f"🩸 血液: {assets_dict['血液']} | ✈️ 旅程: {assets_dict['旅程']} | 👣 追随: {assets_dict['追随']}\n"
@@ -299,19 +299,16 @@ class Gamemale:
         self.task_logger.info(f"互动作业结果: {self.task_result}")
 
     def send_notification(self):
-        # 恢复通过 GitHub Secrets 读取发件服务器，保持高兼容性
         smtp_host = os.getenv("SMTP_HOST")  
-        smtp_port = 465  # 绝大多数邮箱的 SSL 端口都是 465，直接写死即可
+        smtp_port = 465 
         
         mail_user = os.getenv("MAIL_USER")
         mail_pass = os.getenv("MAIL_PASS")
         
-        # 应对 GitHub Actions 传空字符串的坑
         mail_to = os.getenv("MAIL_TO")
         if not mail_to or mail_to.strip() == "":
             mail_to = mail_user
             
-        # 增加对 smtp_host 的非空检测
         if not all([smtp_host, mail_user, mail_pass]):
             self.notice_logger.warning("未配置完整的 SMTP_HOST、发件人邮箱或授权码，跳过邮件通知流程")
             return
@@ -342,6 +339,7 @@ class Gamemale:
             self.notice_logger.info("推送邮件发送成功！")
         except Exception as e:
             self.notice_logger.error(f"推送邮件发送失败: {e}")
+            
     def run(self):
         self.main_logger.info("=== GM-All-In-One 任务引擎启动 ===")
         if not self.login():
