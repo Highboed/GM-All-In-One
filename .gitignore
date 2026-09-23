@@ -1,0 +1,26 @@
+# 凭据类：绝对不能进仓库
+user_cookie.txt
+*.cookie
+cookies.txt
+
+# 运行产物 / 调试输出
+preflight.txt
+run.log
+assets_debug.txt
+gate_*.txt
+*.log
+
+# 本地破门导出的串
+gate_cookie*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
