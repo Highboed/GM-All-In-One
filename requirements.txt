@@ -1,0 +1,15 @@
+# GM-All-In-One 依赖清单
+#
+# 版本策略：下面这些版本是 2026-09-23 实测可用的组合（Windows + Python 3.13）。
+# DrissionPage 与 ddddocr 的 API / onnxruntime 依赖在版本间变动较大，因此精确锁定；
+# 如遇某个版本在 CI 上装不上，可把对应行改成 >= 放宽。
+#
+# 实测组合：
+#   DrissionPage 4.1.1.4  —— cookies() 返回 CookiesList，需 .as_dict()；wait.title_change 为单数
+#   ddddocr 1.6.1         —— 纯 Python wheel，依赖 onnxruntime + opencv
+#   curl_cffi 0.16.3      —— 提供 Chrome TLS 指纹，抗 Cloudflare 指纹识别
+
+requests==2.34.2
+curl_cffi==0.16.3
+DrissionPage==4.1.1.4
+ddddocr==1.6.1
