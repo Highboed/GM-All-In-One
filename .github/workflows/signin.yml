@@ -33,13 +33,17 @@ concurrency:
 
 jobs:
   signin:
-    runs-on: ubuntu-latest
+    # 固定 24.04，不用 ubuntu-latest：
+    # GitHub 已公告 ubuntu-latest 自 2026-10-19 起迁到 Ubuntu 26
+    # （run #228 的 notice 就是这条）。本项目依赖 xvfb + runner 预装 Chrome，
+    # 发行版大版本跳变时先留在已验证的镜像上更稳；想跟进 26 时改这一行即可。
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     env:
       # 定时任务：第二个 cron 走轻量模式；手动触发则用输入值
       GM_RUN_MODE: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode) || (github.event.schedule == '43 6 * * *' && 'light') || 'full' }}
-      # ubuntu-latest 上以 runner 用户运行 Chromium 时建议关闭沙箱（上游原版也是这么做的）
+      # runner 用户运行 Chromium 时建议关闭沙箱（上游原版也是这么做的）
       GM_CHROME_NO_SANDBOX: '1'
       # 强制有头：配合下面的 xvfb-run 提供虚拟显示器。
       # Turnstile 对无头内核评分极低（实测无头 90 秒×3 轮必失败，有头约 8 秒自动通过）。

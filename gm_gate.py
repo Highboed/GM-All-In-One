@@ -60,6 +60,11 @@ www.gamemale.com 在 Discuz 之上装了第三方插件 `dev8133_cloudflare`，�
     所以**不要指望「本地破门一次、CI 用一个月」**。
   * 本机反复自动化探测后，连**有头浏览器**都过不了门了（Turnstile 一直停在
     interaction_required，且 iframe 不渲染）——出口 IP 信誉被降级。
+  * ⚠️ **但不要把「某几次过不了」当成「永远过不了」**（这条是被实测纠正过的）：
+    在修复「点击一直定位不到元素」之后，GitHub Runner 上一次跑通了完整链路
+    （`idle → interaction_required → 点击 → 3 秒后通过`，随后登录/签到/抽奖/互动/资产/邮件全部成功）。
+    早期连续失败的真因是**点击没打中**，不是 IP 信誉。
+    Turnstile 按出口 IP 信誉动态给分 ⇒ 路线 C 是**概率性**的，既非必败也非必胜。
   * 因此：A > B > C。C 只作为最后的兜底。
 
 三、为什么之前一直失败（真正的根因）
@@ -1383,9 +1388,10 @@ return JSON.stringify(out);
 
         self._log("warning",
                   "未配置 %s —— 将走「浏览器破门」。"
-                  "实测：GitHub Runner 的机房 IP 会被 Turnstile 降级，"
-                  "这道门在 CI 上几乎不可能自动通过（日志里会一直停在 interaction_required）。"
-                  "强烈建议配置 %s。" % (USER_COOKIE_ENV, USER_COOKIE_ENV))
+                  "实测这条路在 CI 上「能成功但不稳定」："
+                  "点击定位修好后有过 idle->interaction_required->点击->通过的完整成功，"
+                  "也出现过连续卡在 interaction_required（Turnstile 按出口 IP 信誉动态给分）。"
+                  "要每天稳定成功，建议配置 %s。" % (USER_COOKIE_ENV, USER_COOKIE_ENV))
 
         # 路线 B：之前破门导出的放行 Cookie
         if self.try_preset_cookie(http):
@@ -1435,7 +1441,7 @@ return JSON.stringify(out);
             "无法通过站点验证门，本次任务中止。\n"
             "  站点装的是 dev8133_cloudflare（Turnstile 人机验证）。已经穷尽以下手段：\n"
             "    1) 爬虫 UA 白名单   —— 只能读，拿不到登录验证码，无法登录\n"
-            "    2) 浏览器过 Turnstile —— 机房 IP 被降级，实测必停在 interaction_required\n"
+            "    2) 浏览器过 Turnstile —— 概率性成功（实测有跑通案例，但受出口 IP 信誉波动）\n"
             "    3) 打码平台         —— 未配置 CAPSOLVER_KEY\n"
             "  唯一实测可行且免费的做法：配置 %s（详见 README「第三步」）。\n"
             "  诊断明细已写入 gate_debug.txt（CI 的 Artifact 里可下载）。" % USER_COOKIE_ENV)
@@ -1620,7 +1626,18 @@ def main():
         if not parsed_cookie:
             print("  → 解析不出任何 Cookie：粘贴内容被截断了")
             return 1
-        print("  → Cookie 名: %s" % ", ".join(sorted(parsed_cookie)))
+        # 只报「数量 + 关键项在不在」，不打印完整名单：这一步的输出会被 tee 成
+        # verify_cookie.txt 并上传 Artifact，而公开仓库的 Artifact 是人人可下载的。
+        # 名单本身不是凭据，但没必要外泄（里面有 saltkey / seccodehash 之类）。
+        keys = sorted(parsed_cookie)
+
+        def _has(suffix):
+            return "有" if any(k.endswith(suffix) for k in keys) else "缺"
+
+        print("  → Cookie: %d 项（auth=%s / saltkey=%s / sid=%s）"
+              % (len(keys), _has("_auth"), _has("_saltkey"), _has("_sid")))
+        if args.verbose:
+            print("  → 完整名单（仅本地排障用）: %s" % ", ".join(keys))
         ok = gate.try_user_cookie(http)
         gate.close()
         if ok:

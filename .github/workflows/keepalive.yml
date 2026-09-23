@@ -15,7 +15,9 @@ permissions:
 
 jobs:
   heartbeat:
-    runs-on: ubuntu-latest
+    # 与 signin.yml 保持一致：显式固定镜像，避免 ubuntu-latest 迁到 Ubuntu 26 后
+    # 两个工作流各报一条 notice。这里只跑 git/date，26 上也不会坏，纯粹是求一致。
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6

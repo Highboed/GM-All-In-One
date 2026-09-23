@@ -63,6 +63,16 @@ v1.1（第一次更新，2026-09-23）
   6. 基准文件带「账号指纹」归属标识：别人克隆/复刻本仓库后，第一次运行不会把
      你的金币/血液/积分当成他的基准（否则会显示一个虚假的大额涨跌）。
      空文件/损坏文件不再连带跳过旧 gold_record.txt 的兼容读取。
+
+  补丁 1（复核 CI run #228 产物后）：
+  7. 日志表态口径修正：站点对「今天已表过态」回的是【您已表过态】——那是完成、不是失败。
+     原实现只数「成功」，导致同一天重复运行会把已完成显示成 (1/10)（实测 10/10→6/10→1/10）。
+     现在分别计数，报告写成 (10/10 · 本次新增 N) / (10/10 · 本次无新增)，
+     并把「无表态入口的日志」「预期外的回复」都留下痕迹（原来静默跳过）。
+  8. 日志里的收件人邮箱打码（mask_email）：GitHub 的密钥打码只在网页显示层生效，
+     tee 出来的 run.log 是原文，而它会上传公开仓库的 Artifact —— 必须自己挡。
+  9. ddddocr 改为按需加载：Cookie 模式用不到验证码识别，早导入只会拖慢启动、
+     并在 CI 日志里多刷一条 onnxruntime 的 PCI bus 警告。
 """
 
 import argparse
@@ -91,13 +101,27 @@ from gm_gate import (
     is_gated,
 )
 
-try:
-    import ddddocr
-except Exception as _exc:  # noqa: BLE001
-    ddddocr = None
-    _DDDDOCR_IMPORT_ERROR = _exc
-else:
-    _DDDDOCR_IMPORT_ERROR = None
+# ddddocr 改成「按需导入」：它会连带拉起 onnxruntime（几十 MB、启动慢），
+# 而 Cookie / 蜘蛛模式全程用不到验证码识别，早导入只是白等，
+# 还会在 CI 日志里多刷一条 onnxruntime 的 PCI bus 无害警告。
+ddddocr = None
+_DDDDDOCR_IMPORT_ERROR = None
+
+
+def _load_ddddocr():
+    """按需导入 ddddocr。成功返回模块；失败返回 None，且只记录一次原因。"""
+    global ddddocr, _DDDDOCR_IMPORT_ERROR
+    if ddddocr is not None:
+        return ddddocr
+    if _DDDDOCR_IMPORT_ERROR is not None:
+        return None
+    try:
+        import ddddocr as _mod
+    except Exception as exc:  # noqa: BLE001
+        _DDDDOCR_IMPORT_ERROR = exc
+        return None
+    ddddocr = _mod
+    return ddddocr
 
 DEFAULT_UIDS = [730713, 62445, 61832]
 # 「积分」在积分页不一定出现，抓不到时会自动补抓一次空间首页（见 fetch_assets）
@@ -200,6 +224,27 @@ def fmt_growth(cur, prev):
         return " （首次记录）"
     delta = cur - prev
     return " （较上次 +%d）" % delta if delta >= 0 else " （较上次 %d）" % delta
+
+
+def mask_email(addr):
+    """
+    日志里不出现完整收件人地址。
+
+    为什么必须自己打码：GitHub 的密钥打码只作用于**网页日志的显示层**，
+    `tee run.log` 写出的文件是原文 —— 而 run.log 正是上传到 Artifact 的那份，
+    公开仓库的 Artifact 任何人登录后都能下载。所以别指望平台帮你挡。
+    """
+    addr = (addr or "").strip()
+    if not addr:
+        return "(未配置)"
+    if "@" not in addr:
+        return addr
+    local, _, domain = addr.partition("@")
+    if len(local) <= 3:
+        shown = local[:1] + "***"
+    else:
+        shown = local[:3] + "***" + local[-2:]
+    return "%s@%s" % (shown, domain)
 
 
 def asset_owner_fp(kind, value):
@@ -360,16 +405,25 @@ class Gamemale:
         self.gate = GateKeeper(hostname, self.main_logger, browser_path=chrome_path)
         self.sess = GatedSession(self.http, self.gate, self.main_logger)
 
-        # 验证码识别
+        # 验证码识别器：按需初始化（见 _get_ocr）。Cookie 模式下永远不会加载。
         self.ocr = None
-        if ddddocr is None:
+        self._ocr_loaded = False
+
+    def _get_ocr(self):
+        """首次真正要识别验证码时才加载 ddddocr；不可用时只警告一次。"""
+        if self._ocr_loaded:
+            return self.ocr
+        self._ocr_loaded = True
+        mod = _load_ddddocr()
+        if mod is None:
             self.login_logger.warning("ddddocr 不可用（%s），若站点要求验证码将无法登录"
                                       % _DDDDOCR_IMPORT_ERROR)
-        else:
-            try:
-                self.ocr = ddddocr.DdddOcr(show_ad=False)
-            except Exception as exc:  # noqa: BLE001
-                self.login_logger.warning("ddddocr 初始化失败: %r" % exc)
+            return None
+        try:
+            self.ocr = mod.DdddOcr(show_ad=False)
+        except Exception as exc:  # noqa: BLE001
+            self.login_logger.warning("ddddocr 初始化失败: %r" % exc)
+        return self.ocr
 
     # ---------------------------------------------------------- 基础
 
@@ -483,15 +537,16 @@ class Gamemale:
           4) GET ...&action=check... 让服务端先校验一次，通过再拿去 POST 登录
         第 2 步取不到 update 时，退回「随机 update 直取图片」。
         """
-        if self.ocr is None:
-            return ""
-        modid = modid or "member::logging"
+        # 先判蜘蛛模式：这条路上 misc.php 必 403，没必要为此加载 ddddocr
         if self.spider_mode:
             # 蜘蛛 UA 下 misc.php 整个文件被插件 403，取图必失败，直接点明不要白试 8 轮
             self.login_logger.error(
                 "当前是蜘蛛 UA 模式，misc.php 被站点 403 封死，无法获取验证码图片。"
                 "请改用 GM_USER_COOKIE（自带登录态，无需验证码）")
             return ""
+        if self._get_ocr() is None:
+            return ""
+        modid = modid or "member::logging"
         if not seccodehash:
             self.login_logger.error("没有 idhash，无法取验证码")
             return ""
@@ -727,9 +782,20 @@ class Gamemale:
         return count
 
     def stance_blogs(self, target=10, max_pages=3):
-        count = 0
+        """
+        给最新日志「表态」。返回 (本次新增, 今日已完成, 已检查篇数)。
+
+        站点对「今天已经表过态」的回复是【您已表过态】—— 那是**已完成**，不是失败。
+        原实现只数「成功」，于是同一天重复运行会把「已经做完」显示成 (0/10)、
+        让整份报告看起来像任务挂了（实测 10/10 → 6/10 → 1/10 就是这个原因，
+        越跑越少是因为前面的运行已经把当天的日志都表态完了）。
+        现在把两种结果分开计数，报告就不会误报。
+        """
+        new_count = 0     # 本次真正新表态成功的篇数
+        done_count = 0    # 站点回「已表过态」＝今天已经完成
+        seen = set()
         page = 1
-        while count < target and page <= max_pages:
+        while (new_count + done_count) < target and page <= max_pages:
             list_url = self._url("/home.php?mod=space&do=blog&view=all&catid=14&page=%d" % page)
             try:
                 res = self.sess.get(list_url).text or ""
@@ -742,8 +808,11 @@ class Gamemale:
                 if not blog_urls:
                     self.task_logger.debug("第 %d 页没有解析到日志链接" % page)
                 for uri in blog_urls:
-                    if count >= target:
+                    if (new_count + done_count) >= target:
                         break
+                    if uri in seen:
+                        continue
+                    seen.add(uri)
                     try:
                         blog_res = self.sess.get(
                             self._url("/" + uri.replace("&amp;", "&"))).text or ""
@@ -751,11 +820,23 @@ class Gamemale:
                             r"(home\.php\?mod=spacecp(?:&amp;|&)ac=click(?:&amp;|&)op=add[^\"']+)",
                             blog_res)
                         if not click_match:
+                            # 权限受限 / 已关闭表态的日志：留痕但不算数
+                            self.task_logger.debug(
+                                "跳过一篇没有表态入口的日志（页面 %d 字节）: %s"
+                                % (len(blog_res), uri.replace("&amp;", "&")))
                             continue
                         click_url = self._url("/" + click_match.group(1).replace("&amp;", "&"))
-                        if "成功" in (self.sess.get(click_url, headers={
-                                "x-requested-with": "XMLHttpRequest"}).text or ""):
-                            count += 1
+                        body = self.sess.get(click_url, headers={
+                            "x-requested-with": "XMLHttpRequest"}).text or ""
+                        if "成功" in body:
+                            new_count += 1
+                        elif "已表过态" in body or "已表态" in body:
+                            done_count += 1
+                        else:
+                            self.task_logger.warning(
+                                "日志表态返回预期外的结果: %s"
+                                % re.sub(r"\s+", " ",
+                                         re.sub(r"<[^>]+>", " ", body)).strip()[:90])
                         time.sleep(1)
                     except Exception as exc:  # noqa: BLE001
                         self.task_logger.warning("日志表态失败: %r" % exc)
@@ -763,7 +844,11 @@ class Gamemale:
                 self.task_logger.warning("日志列表第 %d 页异常: %r" % (page, exc))
                 break
             page += 1
-        return count
+        if done_count:
+            self.task_logger.info(
+                "日志表态：本次新增 %d 篇；另有 %d 篇今天已完成（站点回「已表过态」，属完成而非失败）"
+                % (new_count, done_count))
+        return new_count, done_count, len(seen)
 
     def draw_and_guess(self):
         url = self._url("/plugin.php?id=viewui_draw&mod=api&ac=adddraw")
@@ -798,10 +883,19 @@ class Gamemale:
         self.task_logger.info("开始执行互动作业...")
         s_count = self.visit_spaces()
         p_count = self.poke_users()
-        b_count = self.stance_blogs(target=10, max_pages=3)
+        new_b, done_b, _ = self.stance_blogs(target=10, max_pages=3)
         d_status = self.draw_and_guess()
-        self.task_result = ("空间访问(%d/3) | 打招呼(%d/3) | 日志表态(%d/10) | 你画我猜(%s)"
-                            % (s_count, p_count, b_count, d_status))
+        # 日志表态必须区分「本次新增」和「今天已完成」：
+        # 站点对重复表态回「您已表过态」，那是完成、不是失败，直接写成 (1/10) 会误报。
+        total_b = min(new_b + done_b, 10)
+        if done_b and new_b:
+            b_text = "日志表态(%d/10 · 本次新增 %d)" % (total_b, new_b)
+        elif done_b:
+            b_text = "日志表态(%d/10 · 本次无新增)" % total_b
+        else:
+            b_text = "日志表态(%d/10)" % new_b
+        self.task_result = ("空间访问(%d/3) | 打招呼(%d/3) | %s | 你画我猜(%s)"
+                            % (s_count, p_count, b_text, d_status))
         self.task_logger.info("互动作业结果: %s" % self.task_result)
 
     # ---------------------------------------------------------- 资产
@@ -1016,7 +1110,7 @@ class Gamemale:
             return False
 
         status = "成功" if (self.logged_in and not self.fatal_error) else "异常"
-        self.notice_logger.info("发送推送邮件至 %s ..." % mail_to)
+        self.notice_logger.info("发送推送邮件至 %s ..." % mask_email(mail_to))
 
         mail_content = self.build_mail_content(status)
 
