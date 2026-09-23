@@ -89,15 +89,30 @@ jobs:
           fi
 
       - name: Preflight - Site Gate Probe
-        # 只做只读探测，不开浏览器。失败不阻塞主流程，但日志能立刻指认问题在哪一环。
+        # 只做只读探测 + 打印 Cookie 指纹。--no-browser 保证这一步永远秒回、不烧时间。
         continue-on-error: true
         env:
           GM_USER_COOKIE: ${{ secrets.GM_USER_COOKIE }}
           GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
         run: |
           set -o pipefail
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            python gm_gate.py 2>&1 | tee preflight.txt
+          python gm_gate.py --no-browser 2>&1 | tee preflight.txt
+
+      - name: Verify User Cookie
+        # 配了 GM_USER_COOKIE 就必须当场确认能用 —— 不然后面跑了 5 分钟才发现是废串。
+        # 没配则只给一条 warning annotation，不阻塞（脚本会自己走浏览器兜底）。
+        env:
+          GM_USER_COOKIE: ${{ secrets.GM_USER_COOKIE }}
+        run: |
+          set -o pipefail
+          if [ -z "$GM_USER_COOKIE" ]; then
+            echo "::warning title=建议配置 GM_USER_COOKIE::未配置 GM_USER_COOKIE，将回退到浏览器破门。实测 GitHub Runner 的机房 IP 会被 Turnstile 降级，这道门在 CI 上几乎不可能自动通过。请本地执行 python get_user_cookie.py，把打印出的那一整行存成 Secret GM_USER_COOKIE。"
+            exit 0
+          fi
+          if ! python gm_gate.py --verify-cookie 2>&1 | tee verify_cookie.txt; then
+            echo "::error title=GM_USER_COOKIE 不可用::已配置但服务端不认这个登录态（可能是过期、粘贴截断、或 Secret 名写错）。请本地重跑 python get_user_cookie.py 生成新串。"
+            exit 1
+          fi
 
       - name: Run Task Script
         env:
@@ -118,9 +133,14 @@ jobs:
           CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
           # 【路线 C 的加速缓存】本地破门一次导出的放行 Cookie（寿命很短，仅作可选优化）
           GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
+          # 浏览器兜底的成本必须压住：上游默认 3 次 × 90 秒 ≈ 5 分钟，
+          # 而它在 CI 上基本不可能成功（机房 IP 被 Turnstile 降级）。
+          # 1 次 × 75 秒，失败就快速给出可读的结论，而不是干等 5 分钟。
+          GM_BROWSER_ATTEMPTS: '1'
+          GM_SOLVE_TIMEOUT: '75'
         run: |
           set -o pipefail   # 少了它，python 失败会被 tee 吞掉，job 假装成功
-          # 用 xvfb-run 提供虚拟显示器 -> 脚本会自动切换为「有头」Chrome 过 Turnstile
+          # 用 xvfb-run 提供虚拟显示器 -> 脚本自动切换为「有头」Chrome
           EXTRA=""
           if [ "$GM_RUN_MODE" = "check" ]; then EXTRA="--check"; fi
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python gamemale.py $EXTRA 2>&1 | tee run.log
@@ -145,9 +165,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gm-debug-${{ github.run_number }}
+          # 注意：绝对不要加 user_cookie.txt —— 那是登录凭据，上传 Artifact 等于泄露。
           path: |
             assets_debug.txt
             preflight.txt
+            verify_cookie.txt
             run.log
+            gate_debug.txt
           if-no-files-found: ignore
           retention-days: 7
