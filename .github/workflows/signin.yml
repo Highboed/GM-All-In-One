@@ -1,14 +1,49 @@
 name: 'GameMale Auto Sign-in'
 
+# 触发方式
+#  - 每天 00:17（北京时间）全量：破门 → 登录 → 签到 → 抽奖 → 互动 → 抓资产 → 发邮件
+#  - 每天 14:43（北京时间）轻量：只做 破门 → 登录 → 抓资产 → 发邮件，避免重复互动触发风控
+#  - 也支持在 Actions 页面手动 Run workflow（可选 full / light / check）
 on:
   schedule:
-    - cron: '17 16 * * *' # 每天北京时间 00:17 自动运行
-    - cron: '43 6 * * *'  # 每天北京时间 14:43 自动运行
+    - cron: '17 16 * * *'   # UTC 16:17 = 北京 00:17
+    - cron: '43 6 * * *'    # UTC 06:43 = 北京 14:43
   workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式（full=全量 / light=只抓资产 / check=自检不发邮件）'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - light
+          - check
+
+# 关键：金币基准需要 commit + push 回仓库，必须给写权限。
+# 若这里不声明，则完全依赖 Settings -> Actions -> General -> Workflow permissions，
+# 漏配时表现为"邮件能收到但金币涨幅永远是 +0"，且不会报错。
+permissions:
+  contents: write
+
+# 避免两次定时任务叠加执行
+concurrency:
+  group: gm-signin
+  cancel-in-progress: false
 
 jobs:
   signin:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # 定时任务：第二个 cron 走轻量模式；手动触发则用输入值
+      GM_RUN_MODE: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode) || (github.event.schedule == '43 6 * * *' && 'light') || 'full' }}
+      # ubuntu-latest 上以 runner 用户运行 Chromium 时建议关闭沙箱（上游原版也是这么做的）
+      GM_CHROME_NO_SANDBOX: '1'
+      # 强制有头：配合下面的 xvfb-run 提供虚拟显示器。
+      # Turnstile 对无头内核评分极低（实测无头 90 秒×3 轮必失败，有头约 8 秒自动通过）。
+      GM_HEADFUL: '1'
 
     steps:
       - name: Checkout Code
@@ -17,73 +52,76 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
+          cache: pip
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests ddddocr DrissionPage
+          pip install -r requirements.txt
+          python -c "import DrissionPage, ddddocr, curl_cffi, requests; print('deps ok')"
 
-      - name: Start Chrome
+      - name: Install Xvfb
         run: |
-          google-chrome \
-            --headless=new \
-            --no-sandbox \
-            --disable-gpu \
-            --disable-dev-shm-usage \
-            --disable-software-rasterizer \
-            --disable-background-networking \
-            --disable-background-timer-throttling \
-            --disable-renderer-backgrounding \
-            --disable-features=Translate,BackForwardCache \
-            --remote-debugging-address=127.0.0.1 \
-            --remote-debugging-port=9222 \
-            --user-data-dir=/tmp/gm-chrome \
-            > /tmp/chrome.log 2>&1 &
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
 
-          echo "等待 Chrome DevTools 启动..."
+      - name: Show Chrome Version
+        run: google-chrome --version || true
 
-          for i in {1..30}; do
-            if curl -s http://127.0.0.1:9222/json/version > /dev/null; then
-              echo "Chrome DevTools 启动成功"
-              curl -s http://127.0.0.1:9222/json/version
-              break
-            fi
-            sleep 1
-          done
-
-          if ! curl -s http://127.0.0.1:9222/json/version > /dev/null; then
-            echo "Chrome 启动失败"
-            cat /tmp/chrome.log
-            exit 1
-          fi
+      - name: Preflight - Site Gate Probe
+        # 只做只读探测，不开浏览器。失败不阻塞主流程，但日志能立刻指认问题在哪一环。
+        continue-on-error: true
+        env:
+          GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            python gm_gate.py 2>&1 | tee preflight.txt
 
       - name: Run Task Script
         env:
-          USERNAME: ${{ secrets.USERNAME }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          MAIL_USER: ${{ secrets.MAIL_USER }}
-          MAIL_PASS: ${{ secrets.MAIL_PASS }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-          CHROME_DEBUG_ADDRESS: 127.0.0.1:9222
+          GM_USERNAME: ${{ secrets.GM_USERNAME }}
+          GM_PASSWORD: ${{ secrets.GM_PASSWORD }}
+          GM_SMTP_HOST: ${{ secrets.GM_SMTP_HOST }}
+          GM_MAIL_USER: ${{ secrets.GM_MAIL_USER }}
+          GM_MAIL_PASS: ${{ secrets.GM_MAIL_PASS }}
+          GM_MAIL_TO: ${{ secrets.GM_MAIL_TO }}
+          GM_QUESTIONID: ${{ secrets.GM_QUESTIONID }}
+          GM_ANSWER: ${{ secrets.GM_ANSWER }}
+          # 可选：本地破门一次后导出的 Cookie 串（python gm_gate.py --solve --export）。
+          # 配了它就能跳过浏览器，最稳、最快；没配也能跑（走 xvfb + 有头 Chrome）。
+          GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
+          CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
         run: |
-          python gamemale.py
+          # 用 xvfb-run 提供虚拟显示器 -> 脚本会自动切换为「有头」Chrome 过 Turnstile，
+          # 成功率显著高于 headless（脚本检测到 DISPLAY 即走有头模式）
+          EXTRA=""
+          if [ "$GM_RUN_MODE" = "check" ]; then EXTRA="--check"; fi
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python gamemale.py $EXTRA 2>&1 | tee run.log
 
       - name: Commit Asset Record
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           if [ -f gold_record.txt ]; then
             git add gold_record.txt
-            git commit -m "chore: 自动更新每日金币对比基准文件" || echo "今天金币没有任何变化，跳过本次保存"
-            git push
+            if git diff --cached --quiet; then
+              echo "金币无变化，跳过提交"
+            else
+              git commit -m "chore: 自动更新每日金币对比基准文件"
+              git push || echo "!! push 失败：请检查 Settings -> Actions -> General -> Workflow permissions 是否为 Read and write"
+            fi
           fi
 
-      - name: Chrome Log
-        if: failure()
-        run: |
-          echo "===== Chrome Log ====="
-          cat /tmp/chrome.log || true
+      - name: Upload Debug Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gm-debug-${{ github.run_number }}
+          path: |
+            assets_debug.txt
+            preflight.txt
+            run.log
+          if-no-files-found: ignore
+          retention-days: 7
