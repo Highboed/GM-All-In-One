@@ -1,0 +1,30 @@
+name: 'Keepalive Heartbeat'
+
+# 修复点 [P1-1]：上游 README 声称"内置保活工作流，每月自动更新时间戳，破解 GitHub 60 天无活动
+# 暂停 Actions 的限制"，但仓库里其实并不存在这个工作流。
+# 这里补上：每月 1 号提交一次心跳文件，制造仓库活动，避免定时任务被 GitHub 自动停用。
+# （另一个事实上的保活来源是 bot 每天回写 gold_record.txt，但当金币无变化时不会产生提交。）
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'   # 每月 1 号 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Write Heartbeat
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "last heartbeat: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .keepalive
+          git add .keepalive
+          git commit -m "chore: keepalive heartbeat (防止 Actions 因长期无活动被暂停)" || echo "无需提交"
+          git push || echo "!! push 失败：请确认 Workflow permissions 为 Read and write"
