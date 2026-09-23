@@ -69,32 +69,58 @@ jobs:
       - name: Show Chrome Version
         run: google-chrome --version || true
 
+      - name: Check Required Secrets
+        # 一秒钟就能看出「到底哪几个 Secret 没配」，省得跑到一半才报错。
+        env:
+          U: ${{ secrets.GM_USERNAME || secrets.USERNAME }}
+          P: ${{ secrets.GM_PASSWORD || secrets.PASSWORD }}
+          C: ${{ secrets.GM_USER_COOKIE }}
+          K: ${{ secrets.CAPSOLVER_KEY }}
+          G: ${{ secrets.GM_GATE_COOKIE }}
+        run: |
+          echo "GM_USERNAME(GM_*/旧*) : $([ -n "$U" ] && echo 已配置 || echo '!! 缺失')"
+          echo "GM_PASSWORD(GM_*/旧*) : $([ -n "$P" ] && echo 已配置 || echo '!! 缺失')"
+          echo "GM_USER_COOKIE        : $([ -n "$C" ] && echo 已配置 || echo 未配置（将回退到浏览器破门）)"
+          echo "CAPSOLVER_KEY         : $([ -n "$K" ] && echo 已配置 || echo 未配置)"
+          echo "GM_GATE_COOKIE        : $([ -n "$G" ] && echo 已配置 || echo 未配置)"
+          if [ -z "$U" ] || [ -z "$P" ]; then
+            echo "::error::缺少账号 Secret。请在 Settings -> Secrets and variables -> Actions 里添加 GM_USERNAME / GM_PASSWORD（旧的 USERNAME / PASSWORD 也认）。"
+            exit 1
+          fi
+
       - name: Preflight - Site Gate Probe
         # 只做只读探测，不开浏览器。失败不阻塞主流程，但日志能立刻指认问题在哪一环。
         continue-on-error: true
         env:
+          GM_USER_COOKIE: ${{ secrets.GM_USER_COOKIE }}
           GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
         run: |
+          set -o pipefail
           xvfb-run -a --server-args="-screen 0 1920x1080x24" \
             python gm_gate.py 2>&1 | tee preflight.txt
 
       - name: Run Task Script
         env:
-          GM_USERNAME: ${{ secrets.GM_USERNAME }}
-          GM_PASSWORD: ${{ secrets.GM_PASSWORD }}
-          GM_SMTP_HOST: ${{ secrets.GM_SMTP_HOST }}
-          GM_MAIL_USER: ${{ secrets.GM_MAIL_USER }}
-          GM_MAIL_PASS: ${{ secrets.GM_MAIL_PASS }}
-          GM_MAIL_TO: ${{ secrets.GM_MAIL_TO }}
-          GM_QUESTIONID: ${{ secrets.GM_QUESTIONID }}
-          GM_ANSWER: ${{ secrets.GM_ANSWER }}
-          # 可选：本地破门一次后导出的 Cookie 串（python gm_gate.py --solve --export）。
-          # 配了它就能跳过浏览器，最稳、最快；没配也能跑（走 xvfb + 有头 Chrome）。
-          GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
+          # 兼容新旧两套 Secret 名：老 README 让填 USERNAME/PASSWORD，新代码读 GM_*，
+          # 这里用 || 同时认，避免「明明配了却说缺少账号配置」。
+          GM_USERNAME: ${{ secrets.GM_USERNAME || secrets.USERNAME }}
+          GM_PASSWORD: ${{ secrets.GM_PASSWORD || secrets.PASSWORD }}
+          GM_SMTP_HOST: ${{ secrets.GM_SMTP_HOST || secrets.SMTP_HOST }}
+          GM_MAIL_USER: ${{ secrets.GM_MAIL_USER || secrets.MAIL_USER }}
+          GM_MAIL_PASS: ${{ secrets.GM_MAIL_PASS || secrets.MAIL_PASS }}
+          GM_MAIL_TO: ${{ secrets.GM_MAIL_TO || secrets.MAIL_TO }}
+          GM_QUESTIONID: ${{ secrets.GM_QUESTIONID || secrets.QUESTIONID }}
+          GM_ANSWER: ${{ secrets.GM_ANSWER || secrets.ANSWER }}
+          # 【路线 A·推荐】你自己浏览器的登录 Cookie：
+          #   蜘蛛 UA 过门 + 已登录态 => 完全不碰 Turnstile、不需要验证码、不需要浏览器
+          GM_USER_COOKIE: ${{ secrets.GM_USER_COOKIE }}
+          # 【路线 B】打码平台解 Turnstile（付费但全自动）
           CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
+          # 【路线 C 的加速缓存】本地破门一次导出的放行 Cookie（寿命很短，仅作可选优化）
+          GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
         run: |
-          # 用 xvfb-run 提供虚拟显示器 -> 脚本会自动切换为「有头」Chrome 过 Turnstile，
-          # 成功率显著高于 headless（脚本检测到 DISPLAY 即走有头模式）
+          set -o pipefail   # 少了它，python 失败会被 tee 吞掉，job 假装成功
+          # 用 xvfb-run 提供虚拟显示器 -> 脚本会自动切换为「有头」Chrome 过 Turnstile
           EXTRA=""
           if [ "$GM_RUN_MODE" = "check" ]; then EXTRA="--check"; fi
           xvfb-run -a --server-args="-screen 0 1920x1080x24" python gamemale.py $EXTRA 2>&1 | tee run.log
