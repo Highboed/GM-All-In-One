@@ -1,846 +1,1705 @@
 # -*- coding: utf-8 -*-
 """
-GM-All-In-One（修复版）—— GameMale 论坛签到一条龙
+gm_gate.py —— GameMale 站点验证门（dev8133_cloudflare / Turnstile）破解模块
+===========================================================================
 
-与上游原版的差异（修复纲要）
-================================================================
-[P0-1] 验证门识别错误：原版等的是 Cloudflare 的 "Just a moment" 标题，而站点实际返回的是
-       自带插件 dev8133_cloudflare 的「请稍候...」Turnstile 门。现在按门标记
-       (dev8133_cloudflare) 判定并轮询等待，不再固定 sleep(8)。
-[P0-2] 浏览器进程托管不可靠：原版让 CI 在独立 step 里 `&` 起 Chrome，进程可能被回收。
-       现在由脚本自己启动/关闭浏览器，本地与 CI 行为一致。
-[P0-3] 依赖未锁版本：新增 requirements.txt。
-[P0-4] 会话中途被重新拦门时无补救：新增 GatedSession，业务请求被拦门会自动重新破门并重放。
-[P0-5] DrissionPage 4.x 的 cookies() 不接受 as_dict 关键字（原版写法会抛 TypeError），
-       且未显式指定浏览器路径时会 BrowserConnectError —— 均已在 gm_gate.py 修正。
-[P1-2] idhash=cSA 硬编码 → 改为从登录页解析 seccodehash / seccodemodid。
-[P1-3] 一天跑两次都是全量重复 → 支持 GM_RUN_MODE=light（只登录 + 抓资产 + 发报告）。
-[P1-4] 资产抓取失败时会写入 0 污染金币基准 → 现在仅在解析成功时才回写 gold_record.txt。
-[P1-5] 裸 except: pass 掩盖故障 → 全部改为带日志的捕获。
-[P1-6] 安全提问未接入 → 支持 GM_QUESTIONID / GM_ANSWER 环境变量。
-[P1-7] 互动对象 UID 硬编码 → 支持 GM_UIDS 覆盖。
-[P2-3] 验证码 update 地址缺参数名（&0.1234567）→ 改为 &_=<时间戳>。
-[P2-6] 日志表态计数初值 1 导致报告失真 → 改为 0。
-[新增] 运行失败也会发一封说明邮件（原版失败时静默）。
-[新增] --check 自检模式：只破门 + 登录 + 抓资产，不发邮件，用于首次部署验证。
+一、这道「Cloudflare 拦截」到底是什么
+------------------------------------
+www.gamemale.com 在 Discuz 之上装了第三方插件 `dev8133_cloudflare`，它把**几乎所有前台
+入口**（forum.php / member.php / home.php / misc.php / plugin.php / k_misign-sign.html
+/ space-uid-*.html …）都拦在一个人机验证页后面：
 
-[新增·第二期] 过门路线重排（理由见 gm_gate.py 顶部）
-    路线 A  GM_USER_COOKIE（推荐）：蜘蛛 UA + 你自己的登录 Cookie，
-            **完全不碰 Turnstile、不需要验证码、不需要浏览器**。
-    路线 B  CAPSOLVER_KEY：打码平台解 Turnstile → 提交换放行 Cookie → HTTP 登录（验证码走 ddddocr）。
-    路线 C  浏览器破门（xvfb + 有头 Chrome）：兜底。实测受出口 IP 信誉影响很大。
+    <title>请稍候...</title>
+    turnstile.render("#turnstile", {sitekey: "0x4AAAAAAEqRGyPbvEznAcKy", appearance: "always"})
+    → 拿到 token 后 axios.post("plugin.php?id=dev8133_cloudflare", {token})
+    → 服务端调 Cloudflare siteverify，成功返回 {"code":200} 并种下放行 Cookie
 
-用法
-----
-    GM_USERNAME / GM_PASSWORD                                必需（路线 A 下仅用于兜底登录）
-    GM_USER_COOKIE                                           强烈推荐（见下方说明）
-    GM_SMTP_HOST / GM_MAIL_USER / GM_MAIL_PASS / GM_MAIL_TO   可选，缺省则不发邮件
-    CAPSOLVER_KEY                                            可选，打码平台兜底
-    （兼容上游旧变量名 USERNAME / PASSWORD / SMTP_HOST / MAIL_USER / MAIL_PASS / MAIL_TO；
-      注意 Windows 上 USERNAME 是系统内置变量，本地务必用 GM_USERNAME）
+所以**它不是 Cloudflare 自带的 "Just a moment" 挑战页**，而是站点自己架的 Turnstile 关卡。
+关键推论：
+  * token 由 Cloudflare 服务端校验，**无法伪造**（实测伪造返回
+    {"code":-1,...,"data":{"error_code":"invalid-input-response"}}）；
+  * `appearance: "always"` 强制显示复选框，所以「看起来总是要你点一下」。
 
-    关于 GM_USER_COOKIE —— 怎么拿？
-      在自己电脑的浏览器里正常登录 www.gamemale.com，然后：
-        F12 → 网络(Network) → 随便点一个 gamemale.com 的请求
-        → 请求头(Request Headers) → 复制整行 Cookie: 后面的值
-      （也可以在 应用/Application → Cookies → https://www.gamemale.com 里
-        找 TVj0_2132_auth、TVj0_2132_saltkey、TVj0_2132_sid 拼成 name=value; name=value）
-      粘贴时必须带上，否则服务端认不出登录态。
-      有效期约 30 天（登录时 cookietime=2592000），过期后重新复制一次即可。
+二、实测出来的三条边界（很重要，决定了整个方案的形状）
+------------------------------------------------------
+1. **爬虫 UA 白名单**：插件放行 Googlebot / Bingbot / Baiduspider / Sogou / 360Spider /
+   YisouSpider / Bytespider（不放行 YandexBot 与普通浏览器 UA）。用 Baiduspider UA 时，
+   forum.php / member.php / home.php / plugin.php?id=k_misign:sign / space-uid-*.html
+   **全部 200 且不设防** —— 也就是说白名单 UA 能读完整个站点，连签到插件页都能打开。
+2. **`misc.php` 整个文件对全部白名单 UA 返回 403（空 body）**。
+   不只是 seccode —— `misc.php?mod=faq` 也是 403，说明拦截粒度是「路径」而不是「参数」。
+   大小写 / 双斜杠 / `/.` / `/foo/..` / PATH_INFO / `%20` / POST 全试过，一律 403。
+   后果：登录验证码图片拿不到 → **蜘蛛 UA 无法完成登录**。
+3. **但白名单 UA 的 POST 是放行的**（这一点极关键）：
+       POST /member.php?...loginsubmit=yes  → 200，业务层回「抱歉，验证码填写错误」
+       POST /plugin.php?id=k_misign:sign    → 200，业务层回「您所在用户组不允许使用」
+   也就是说插件**只挡 misc.php**，写操作本身不挡。
+   ⇒ 只要手上有一枚**已登录的 Discuz Cookie**，蜘蛛 UA 就能把整套签到做完，
+     **完全不需要 Turnstile、不需要验证码、不需要浏览器**（见下面的「用户 Cookie 模式」）。
+4. **移动端 API `api/mobile/index.php` 完全不受门保护**（`module=check` 返回
+   `{"testcookie":null}`，`module=register` 返回移动版注册页），
+   但 `module=login` / `module=seccode` 返回 **0 字节** —— 站点把这两个模块摘掉了。
+5. **过门校验接口 `/plugin.php?id=dev8133_cloudflare` 自己不受门保护**，
+   对它 POST 假 token 会返回 `{"code":-1,...,"error_code":"invalid-input-response"}`。
+   ⇒ 打码平台（CapSolver）可以在**它自己的 IP** 上解出 token，我们再从任意 IP 提交换放行 Cookie。
+     （代价：一条 CapSolver key，约 $0.001/次）
 
-    python gamemale.py            正常运行
-    python gamemale.py --check    自检：破门 + 登录 + 抓资产，不发邮件
+三条可行路线（按推荐度排序，代码里都有）
+----------------------------------------
+  A. **用户 Cookie 模式**（最稳、免费、零浏览器）
+     `GM_USER_COOKIE` = 你自己浏览器里的登录 Cookie（`TVj0_2132_auth` 等，有效期 30 天）
+     配好后：蜘蛛 UA 过门 + 已有登录态 ⇒ 只跑业务请求。**完全不碰 Turnstile**。
+  B. **打码平台模式**（全自动，付费）
+     `CAPSOLVER_KEY` ⇒ 解 Turnstile → 提交校验接口换放行 Cookie → 走 HTTP 登录（验证码交给 ddddocr）。
+  C. **浏览器模式**（兜底，最不稳）
+     xvfb + 有头 Chrome 现场过 Turnstile。实测受出口 IP 信誉影响很大（见下面第四节）。
+
+⚠️ 关于路线的稳定性（实测结论）
+--------------------------------
+  * 放行 Cookie 寿命很短：15:22 导出的串，18:25 已失效（同一台机器、同一出口 IP），
+    所以**不要指望「本地破门一次、CI 用一个月」**。
+  * 本机反复自动化探测后，连**有头浏览器**都过不了门了（Turnstile 一直停在
+    interaction_required，且 iframe 不渲染）——出口 IP 信誉被降级。
+  * 因此：A > B > C。C 只作为最后的兜底。
+
+三、为什么之前一直失败（真正的根因）
+------------------------------------
+失败日志里 Turnstile 状态永远停在 `interaction_required`，看起来像「点击没生效」。
+实际根因是 **无头模式**：`ChromiumOptions.headless(True)` 带的是旧无头内核，
+Cloudflare 一眼识破，于是永远给出交互挑战，而且点击永远不通过。
+
+实测对照：
+    headless=True  → 90 秒 × 3 轮，始终 interaction_required，失败
+    headless=False → **约 10 秒自动通过，一次点击都不需要**
+
+所以本模块的策略是 **有头优先**（CI 里用 xvfb-run 提供虚拟显示器，等价于有头）。
+
+四、对外接口
+------------
+    gate = GateKeeper(hostname="www.gamemale.com", logger=logger)
+    gate.classify(http)        # 判定门口状态（直连 / 爬虫白名单 / 必须浏览器 / 通不了）
+    gate.ensure_access(http)   # 保证 http 引擎已「过门」，必要时起浏览器
+    gate.close()               # 释放浏览器
+
+命令行诊断（不需要账号密码）
+----------------------------
+    python gm_gate.py                      # 探测门口状态
+    python gm_gate.py --solve              # 起浏览器实际破门
+    python gm_gate.py --solve --headed     # 强制有头（CI 配合 xvfb-run）
+    python gm_gate.py --solve --probe-login   # 破门后顺带验证「登录页+验证码图片」是否可达
+    python gm_gate.py --solve --export     # 破门后导出 Cookie 串（塞进 GitHub Secret 用）
+    python gm_gate.py --capsolver KEY      # 用打码平台直接取 token
 """
 
 import argparse
+import base64
 import hashlib
-import logging
+import json
 import os
 import re
-import smtplib
+import shutil
 import sys
 import time
-from email.header import Header
-from email.mime.text import MIMEText
-from email.utils import formataddr
 
-from gm_gate import (
-    DEFAULT_HOST,
-    SPIDER_BLOCKED_PATHS,
-    USER_COOKIE_ENV,
-    USER_COOKIE_MODE,
-    GateError,
-    GateKeeper,
-    GatedSession,
-    HttpEngine,
-    is_gated,
+# ---------------------------------------------------------------- 站点常量
+
+DEFAULT_HOST = "www.gamemale.com"
+GATE_URL = "https://www.gamemale.com/forum.php"
+
+GATE_MARKER = "dev8133_cloudflare"
+TURNSTILE_SITEKEY = "0x4AAAAAAEqRGyPbvEznAcKy"
+VERIFY_PATH = "/plugin.php?id=dev8133_cloudflare"
+
+# Cookie 复用（CI 免起浏览器）
+COOKIE_ENV = "GM_GATE_COOKIE"
+
+# 用户自己的登录 Cookie（最稳的一条路：蜘蛛 UA + 已有登录态，全程不碰 Turnstile）
+USER_COOKIE_ENV = "GM_USER_COOKIE"
+SPIDER_UA_ENV = "GM_SPIDER_UA"
+
+# 蜘蛛 UA 下被插件封死的路径（前缀匹配）。用到这里要提前报错，别等 403 才猜。
+SPIDER_BLOCKED_PATHS = ("misc.php",)
+
+# 登录态判定：Discuz 会在页面里输出 discuz_uid
+UID_RE = re.compile(r"discuz_uid\s*=\s*['\"]?(\d+)")
+
+CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-try:
-    import ddddocr
-except Exception as _exc:  # noqa: BLE001
-    ddddocr = None
-    _DDDDOCR_IMPORT_ERROR = _exc
-else:
-    _DDDDOCR_IMPORT_ERROR = None
+# 实测可通过插件的搜索引擎 UA（用于 classify 判定 + 破门失败时的降级只读）
+SPIDER_UAS = [
+    ("Baiduspider",
+     "Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)"),
+    ("Googlebot",
+     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
+    ("Bingbot",
+     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"),
+    ("Sogou",
+     "Sogou web spider/4.0(+http://www.sogou.com/docs/help/webmasters.htm#07)"),
+    ("360Spider",
+     "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) "
+     "Chrome/38.0.2125.122 Safari/537.36 360Spider"),
+]
 
-DEFAULT_UIDS = [730713, 62445, 61832]
-ASSET_ITEMS = ["金币", "血液", "旅程", "追随", "知识", "咒术", "堕落", "灵魂"]
+# 可选隐身脚本。**默认不注入**：实测有头模式下不注入也能一次过，
+# 而 Object.defineProperty(navigator,'webdriver') 这种改法本身就是一个可被检测的特征。
+# 只有当你确实需要无头模式且愿意冒风险时，才设 GM_STEALTH=1。
+STEALTH_JS = """
+try { delete Object.getPrototypeOf(navigator).webdriver; } catch (e) {}
+window.chrome = window.chrome || {};
+"""
+
+# 门口状态
+OPEN = "open"              # 门没开（站点未启用插件），普通 UA 直连即可
+SPIDER_OK = "spider"       # 门开着，爬虫白名单可通行（**只能读，无法登录**）
+NEED_BROWSER = "browser"   # 必须真实浏览器过 Turnstile
+UNKNOWN = "unknown"        # 网络异常，无法判定
+USER_COOKIE_MODE = "user_cookie"   # 蜘蛛 UA + 用户自己的登录 Cookie，全程不碰 Turnstile
 
 
-# =============================================================== 工具函数
+class GateError(Exception):
+    """过门失败。"""
 
 
-def setup_logger(name, verbose=False):
-    logger = logging.getLogger(name)
+def _env_int(name, default, low, high):
+    """读一个整数型环境变量，非法值一律回落到默认值（绝不因此炸掉流程）。"""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return max(low, min(high, val))
+
+
+# ---------------------------------------------------------------- Cookie 复用编解码
+
+
+def encode_cookie_blob(cookies, ua=None):
+    """
+    把 cookie 字典编码成可塞进 GitHub Secret 的单行字符串。
+
+    必须**连 User-Agent 一起带**：放行 Cookie 是跟浏览器会话绑定的，
+    Cookie 与 UA 只要对不上，复验就会被打回验证门。
+    """
+    payload = {"ua": ua or CHROME_UA, "cookies": cookies}
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_cookie_blob(blob):
+    """解码。返回 (ua, cookies)。兼容早期「裸 cookie 字典」格式。"""
+    txt = base64.urlsafe_b64decode(blob.strip().encode("ascii")).decode("utf-8")
+    data = json.loads(txt)
+    if not isinstance(data, dict):
+        raise ValueError("Cookie 串格式不对")
+    if isinstance(data.get("cookies"), dict):
+        return (data.get("ua") or CHROME_UA), data["cookies"]
+    return CHROME_UA, data
+
+
+def cookie_fingerprint(raw):
+    """
+    算一个短的「指纹」，用来确认 CI 里拿到的 Secret 和你本地生成的那串**完全一致**。
+
+    这个功能是必需的：GitHub Secret 配错名字 / 粘漏了字符 / 带上了多余换行时，
+    脚本表现和「没配」几乎一样，日志里根本看不出来。有了指纹就能一句话对上。
+    """
+    txt = (raw or "").strip()
+    if not txt:
+        return "(空)"
+    return hashlib.sha256(txt.encode("utf-8")).hexdigest()[:12]
+
+
+def parse_cookie_header(raw):
+    """
+    把浏览器里复制出来的 `Cookie:` 头解析成字典。
+
+    兼容几种常见粘贴形态（都是实测遇到过的）：
+        a=1; b=2                  ← DevTools > Network > Cookie 头，最标准
+        Cookie: a=1; b=2          ← 连 "Cookie:" 一起复制了
+        a=1;\nb=2                 ← 多行
+        {"a": "1", "b": "2"}      ← 从别处导出的 JSON
+        "a=1; b=2"                ← 带引号
+    值里含 '='（如 base64 的 auth）也能正确切分：只在**第一个** '=' 处切。
+    """
+    if not raw:
+        return {}
+    txt = raw.strip()
+
+    # 形态：整段 JSON
+    if txt.startswith("{"):
+        try:
+            data = json.loads(txt)
+            if isinstance(data, dict):
+                flat = {}
+                for k, v in data.items():
+                    if isinstance(k, str):
+                        flat[k] = "" if v is None else str(v)
+                if flat:
+                    return flat
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 去掉包裹引号
+    if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in ("'", '"'):
+        txt = txt[1:-1]
+
+    # 形态：带 "Cookie:" 前缀
+    low = txt.lower()
+    if low.startswith("cookie:"):
+        txt = txt.split(":", 1)[1]
+    txt = txt.replace("\r", " ").replace("\n", " ")
+    # 有人会把 curl 的 -H 内容整段粘进来，这里顺手剥掉常见的包裹
+    txt = txt.strip().strip("'\"")
+    if txt.lower().startswith("cookie:"):
+        txt = txt.split(":", 1)[1]
+
+    out = {}
+    for part in txt.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip().strip("'\"")
+        if name and " " not in name:      # cookie 名里不可能有空格，有就是粘错了
+            out[name] = value.strip()
+    return out
+
+
+def detect_uid(html):
+    """从页面里读出 discuz_uid。游客是 0，已登录是真实 uid。读不到返回 None。"""
+    m = UID_RE.search(html or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------- HTTP 引擎
+
+
+class HttpEngine:
+    """
+    统一 HTTP 引擎。优先 curl_cffi（带 Chrome 的 TLS/HTTP2 指纹），不可用时回退 requests。
+    两者对外接口一致。
+
+    trust_env 默认 False：本机 shell 会强制注入一个不可用的 HTTP_PROXY，
+    而 www.gamemale.com 国内直连即可，绝不能被环境变量带偏。
+    """
+
+    def __init__(self, hostname=DEFAULT_HOST, logger=None, timeout=30,
+                 impersonate="chrome", trust_env=False):
+        self.hostname = hostname
+        self.logger = logger
+        self.timeout = timeout
+        self.impersonate = impersonate
+        self.trust_env = trust_env
+        self.kind = "requests"
+        self.session = None
+        self.user_agent = CHROME_UA
+        self._build_session()
+
+    # -- 内部 ------------------------------------------------------------
+
+    def _log(self, level, msg):
+        if self.logger:
+            getattr(self.logger, level)(msg)
+
+    def _build_session(self):
+        if self.impersonate:
+            try:
+                from curl_cffi import requests as cffi_requests
+                self.session = cffi_requests.Session(
+                    impersonate=self.impersonate, trust_env=self.trust_env)
+                self.kind = "curl_cffi(%s)" % self.impersonate
+            except Exception as exc:  # noqa: BLE001
+                self._log("warning", "curl_cffi 不可用(%s)，回退 requests" % exc)
+        if self.session is None:
+            import requests as _requests
+            self.session = _requests.Session()
+            if not self.trust_env:
+                self.session.trust_env = False
+            self.kind = "requests"
+        self._apply_default_headers()
+        return self.session
+
+    def _apply_default_headers(self):
+        self.session.headers.update({
+            "User-Agent": self.user_agent,
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                       "image/avif,image/webp,image/apng,*/*;q=0.8"),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Upgrade-Insecure-Requests": "1",
+        })
+
+    # -- 对外 ------------------------------------------------------------
+
+    def set_user_agent(self, ua):
+        if ua:
+            self.user_agent = ua
+            self.session.headers.update({"User-Agent": ua})
+
+    def set_referer(self, url):
+        if url:
+            self.session.headers.update({"Referer": url})
+        return self
+
+    def set_cookies(self, cookies, domain=None):
+        """
+        把浏览器拿到的 cookie 注入会话。不同引擎的 CookieJar 接口有差异，多策略尝试。
+        """
+        if not cookies:
+            return 0
+        domain = domain or ("." + self.hostname if not self.hostname.startswith(".")
+                            else self.hostname)
+        jar = self.session.cookies
+        for name, value in cookies.items():
+            for attempt in (
+                lambda n=name, v=value: jar.set(n, v, domain=domain, path="/"),
+                lambda n=name, v=value: jar.set(n, v, domain=domain),
+                lambda n=name, v=value: jar.set(n, v),
+            ):
+                try:
+                    attempt()
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+        try:
+            jar.update({k: v for k, v in cookies.items()})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return len(self.session.cookies)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def cookie_dict(self):
+        try:
+            return {c.name: c.value for c in self.session.cookies}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def cookie_string(self):
+        return "; ".join("%s=%s" % (k, v) for k, v in self.cookie_dict().items())
+
+    def clear_cookies(self):
+        try:
+            self.session.cookies.clear()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def get(self, url, **kw):
+        kw.setdefault("timeout", self.timeout)
+        kw.setdefault("allow_redirects", True)
+        return self.session.get(url, **kw)
+
+    def post(self, url, **kw):
+        kw.setdefault("timeout", self.timeout)
+        kw.setdefault("allow_redirects", True)
+        return self.session.post(url, **kw)
+
+
+# ---------------------------------------------------------------- 门口判定
+
+
+def is_gated(text):
+    """响应体是否是那个验证门页面。"""
+    if not text:
+        return False
+    return GATE_MARKER in text
+
+
+def looks_like_forum(text):
+    """响应体是否是真正的论坛页面（而非验证门 / 空壳）。"""
+    if not text:
+        return False
+    if is_gated(text):
+        return False
+    if "formhash" in text:
+        return True
+    if "discuz" in text.lower():
+        return True
+    return len(text) > 20000
+
+
+# ---------------------------------------------------------------- 门口处理
+
+
+class GateKeeper:
+    """负责识别并破解验证门，把可用会话交给 HttpEngine。"""
+
+    def __init__(self, hostname=DEFAULT_HOST, logger=None,
+                 headless=None, browser_path=None,
+                 solve_timeout=90, browser_attempts=3,
+                 manual=False, export_cookie=False):
+        self.hostname = hostname
+        self.logger = logger
+        # 浏览器兜底的开销在 CI 上要压住：一轮 90 秒 × 3 次 ≈ 5 分钟纯浪费。
+        # 两者都可以用环境变量覆盖，调完不用改代码。
+        self.solve_timeout = _env_int("GM_SOLVE_TIMEOUT", solve_timeout, 20, 600)
+        self.browser_attempts = _env_int("GM_BROWSER_ATTEMPTS", browser_attempts, 1, 5)
+        self.manual = manual
+        self.export_cookie = export_cookie
+        self.browser_path = browser_path or os.getenv("GM_CHROME_PATH") or self.find_chrome()
+        self.user_data_dir = os.getenv("GM_USER_DATA_DIR") or None
+        self.headless = self._decide_headless() if headless is None else headless
+        self.page = None
+        self.state = UNKNOWN
+        self.spider_ua_name = None
+        self._profile_dir = None
+        self._passed_via_http = False   # 是否靠「抓 token 走 HTTP」过的门
+        self.gate_cookie_blob = None    # 过门后导出的 Cookie 串
+        self.gate_mode = None           # 最终采用的过门方式（user_cookie / browser / ...）
+        self.logged_uid = None          # 用户 Cookie 模式下的已登录 uid
+        # GM_USER_COOKIE 的状态：absent / broken / expired / gated / ok
+        # 区分「没配」「配了但解析不出」「配了但已失效」，才能给出对的提示。
+        self.user_cookie_state = None
+
+    def url(self, path):
+        """拼绝对地址。path 需以 / 开头。"""
+        if path.startswith("http"):
+            return path
+        return "https://%s%s" % (self.hostname, path)
+
+    # -- 基础 ------------------------------------------------------------
+
+    @staticmethod
+    def find_chrome():
+        """
+        显式定位 Chrome。DrissionPage 默认的 browser_path='chrome' 在部分环境下
+        会直接抛 BrowserConnectError，所以这里自己找一遍。
+        """
+        cands = []
+        for name in ("google-chrome", "google-chrome-stable", "chrome", "chrome.exe",
+                     "chromium", "chromium-browser"):
+            w = shutil.which(name)
+            if w:
+                cands.append(w)
+        if sys.platform.startswith("win"):
+            cands += [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
+            ]
+            try:
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe")
+                cands.insert(0, winreg.QueryValueEx(key, "")[0])
+            except Exception:  # noqa: BLE001
+                pass
+        elif sys.platform == "darwin":
+            cands.append("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        else:
+            cands += ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+                      "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"]
+        for c in cands:
+            try:
+                if c and os.path.exists(c):
+                    return c
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _log(self, level, msg):
+        if self.logger:
+            getattr(self.logger, level)(msg)
+        else:
+            print("[%s] %s" % (level.upper(), msg))
+
+    def _decide_headless(self):
+        """
+        默认策略：**有头优先**。
+        Turnstile 对无头内核的评分极低（实测无头 90 秒×3 轮必失败，有头约 10 秒自动通过）。
+        Linux/CI 下如果没有 DISPLAY，才退回无头；CI 里请用 xvfb-run 提供虚拟显示器。
+        """
+        env = (os.getenv("GM_HEADLESS") or "").strip().lower()
+        if env in ("1", "true", "yes", "on"):
+            return True
+        if env in ("0", "false", "no", "off"):
+            return False
+        if (os.getenv("GM_HEADFUL") or "").strip().lower() in ("1", "true", "yes", "on"):
+            return False
+        if sys.platform.startswith("linux"):
+            return not bool(os.getenv("DISPLAY"))
+        return False
+
+    @property
+    def forum_url(self):
+        return "https://%s/forum.php" % self.hostname
+
+    # -- 探测 ------------------------------------------------------------
+
+    def _probe(self, http, ua=None):
+        """用指定 UA 探一次 forum.php，返回 (状态码, 是否被门拦住, 正文长度)。"""
+        headers = {"Referer": "https://%s/" % self.hostname}
+        if ua:
+            headers["User-Agent"] = ua
+        try:
+            resp = http.get(self.forum_url, headers=headers)
+            text = resp.text or ""
+            return resp.status_code, is_gated(text), len(text)
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "探测请求失败: %r" % exc)
+            return 0, False, 0
+
+    def classify(self, http=None):
+        """
+        判定门口形态：
+          OPEN         站点未启用插件 / 已有放行 Cookie，普通 UA 直连可用
+          SPIDER_OK    开着门，但爬虫 UA 白名单能过（**可读不可登录**）
+          NEED_BROWSER 必须真实浏览器过 Turnstile
+          UNKNOWN      网络不通，判定不了
+
+        注意：探测过程会临时借用爬虫 UA，结束时必须把原 UA 还原，
+        否则后续业务请求会莫名其妙以 Baiduspider 身份发出去。
+        """
+        own = http is None
+        if own:
+            http = HttpEngine(self.hostname, self.logger)
+            http.set_user_agent(CHROME_UA)
+
+        orig_ua = http.user_agent
+        try:
+            # 基准探测**显式**用普通浏览器 UA：不能依赖 session 里当前的 UA，
+            # 因为前面若借用过蜘蛛 UA（或调用方设置了别的 UA），会把「门是否开着」判错。
+            code, gated, size = self._probe(http, ua=CHROME_UA)
+            if code == 0:
+                self.state = UNKNOWN
+                self._log("error", "无法连接 %s，请检查网络" % self.hostname)
+                return self.state
+
+            if not gated:
+                self.state = OPEN
+                self._log("info", "门口状态：OPEN —— 普通 UA 可直连（HTTP %s, %d 字节）"
+                          % (code, size))
+                return self.state
+
+            self._log("info", "检测到 dev8133_cloudflare 验证门（HTTP %s, %d 字节），"
+                              "尝试爬虫白名单..." % (code, size))
+            for name, ua in SPIDER_UAS:
+                code2, gated2, size2 = self._probe(http, ua=ua)
+                if code2 == 200 and not gated2:
+                    self.state = SPIDER_OK
+                    self.spider_ua_name = name
+                    self._log("info", "爬虫白名单命中：%s（HTTP %s, %d 字节）—— 页面与 POST "
+                                      "都放行，但 misc.php 整个文件 403，"
+                                      "所以拿不到登录验证码；要登录需 %s 或过 Turnstile"
+                                      % (name, code2, size2, USER_COOKIE_ENV))
+                    break
+                self._log("debug", "  白名单未命中: %s (HTTP %s)" % (name, code2))
+            else:
+                self.state = NEED_BROWSER
+                self._log("info", "门口状态：NEED_BROWSER —— 必须用真实浏览器过 Turnstile")
+            return self.state
+        finally:
+            if http.user_agent != orig_ua:
+                http.set_user_agent(orig_ua)
+
+    # -- 浏览器破门 -------------------------------------------------------
+
+    def _build_options(self, udd=None):
+        from DrissionPage import ChromiumOptions
+
+        co = ChromiumOptions()
+        if self.browser_path:
+            co.set_browser_path(self.browser_path)
+        co.set_argument("--disable-blink-features", "AutomationControlled")
+        co.set_argument("--lang", "zh-CN")
+        co.set_argument("--window-size", "1280,900")
+        co.set_argument("--disable-notifications")
+        co.set_argument("--disable-popup-blocking")
+        co.set_argument("--no-first-run")
+        co.set_argument("--no-default-browser-check")
+        if self.headless:
+            # Chrome 132+ 的 --headless 已是新内核；显式写 =new 更保险
+            co.set_argument("--headless=new")
+            co.set_argument("--disable-gpu")
+        if os.getenv("GM_CHROME_NO_SANDBOX", "").strip() in ("1", "true", "yes"):
+            co.set_argument("--no-sandbox")
+            co.set_argument("--disable-dev-shm-usage")
+        co.set_timeouts(base=20, page_load=60, script=30)
+        proxy = os.getenv("GM_CHROME_PROXY")
+        if proxy:
+            co.set_proxy(proxy)
+        if udd:
+            co.set_user_data_path(udd)
+        return co
+
+    def _launch_browser(self):
+        """
+        启动浏览器。
+
+        注意 1：实测（Chrome 153 + DrissionPage 4.1.1.4）显式 set_user_data_path() 会导致
+        ChromiumPage 抛 BrowserConnectError —— 默认不指定 profile，交给 DrissionPage 自管。
+        注意 2：不注入任何 JS（见 STEALTH_JS 注释）。
+        """
+        from DrissionPage import ChromiumPage
+
+        if self.page is not None:
+            return self.page
+
+        candidates = []
+        if self.user_data_dir:
+            candidates.append(self.user_data_dir)
+        candidates.append(None)
+
+        last_exc = None
+        for udd in candidates:
+            co = self._build_options(udd)
+            self._log("info", "启动浏览器（headless=%s, path=%s, profile=%s, proxy=%s）"
+                      % (self.headless, self.browser_path or "自动查找",
+                         udd or "临时目录", os.getenv("GM_CHROME_PROXY") or "无"))
+            try:
+                self.page = ChromiumPage(co)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                self._log("warning", "启动失败（profile=%s）: %r" % (udd or "临时目录", exc))
+                if udd is not None:
+                    self._log("warning", "改用 DrissionPage 自管临时 profile 重试")
+                continue
+            if (os.getenv("GM_STEALTH") or "").strip() in ("1", "true", "yes"):
+                try:
+                    self.page.add_init_js(STEALTH_JS)
+                except Exception as exc:  # noqa: BLE001
+                    self._log("warning", "注入隐身脚本失败（不影响主流程）: %r" % exc)
+            self._profile_dir = udd
+            return self.page
+
+        self.page = None
+        raise last_exc if last_exc else RuntimeError("浏览器启动失败")
+
+    # 页面内探针。**必须把 return 写在脚本顶层**：DrissionPage 会把脚本包进函数体，
+    # 写成 (function(){...})() 这种 IIFE 会返回 None。
+    _STATE_JS = ("var m=document.getElementById('check_msg');"
+                 "return m ? m.innerText.replace(/\\s+/g,' ').trim() : '';")
+
+    _TOKEN_JS = ("var i=document.querySelector('input[name=\"cf-turnstile-response\"]');"
+                 "return i ? (i.value || '') : '';")
+
+    # 定位 Turnstile widget。返回 JSON 里带 what / iframes 是为了诊断：
+    # 之前 CI 日志里从来没有出现过「已点击复选框」，说明这里一直返回空，
+    # 但当时没有任何信息能看出是「没有 iframe」还是「选择器写错了」。
+    _GBOX_JS = """
+var out = {what:'', x:0, y:0, w:0, h:0, iframes:[]};
+try {
+  var all = document.querySelectorAll('iframe');
+  for (var i=0;i<all.length;i++){ out.iframes.push((all[i].src||'(no-src)').slice(0,110)); }
+  var el = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+  if (el) out.what = 'iframe';
+  if (!el) {
+    var host = document.getElementById('turnstile')
+            || document.querySelector('.cf-turnstile')
+            || document.querySelector('div[data-sitekey]');
+    if (host) {
+      var sr = host.shadowRoot;
+      if (sr) {
+        var f2 = sr.querySelector('iframe');
+        if (f2) { el = f2; out.what = 'shadow-iframe'; }
+      }
+      if (!el) { el = host; out.what = 'container'; }
+    }
+  }
+  if (el) {
+    var r = el.getBoundingClientRect();
+    out.x = r.x; out.y = r.y; out.w = r.width; out.h = r.height;
+    if (out.w < 1 || out.h < 1) { out.what = out.what + '(zero-size)'; }
+  }
+} catch (e) { out.what = 'error:' + e; }
+return JSON.stringify(out);
+"""
+
+    # 破门失败时落盘的诊断快照。CI 里能通过 Artifact 下载下来直接看。
+    _DIAG_JS = """
+var out = {url: location.href, ready: document.readyState, iframes: [], token: '', msg: ''};
+try {
+  var m = document.getElementById('check_msg');
+  out.msg = m ? m.innerText.replace(/\\s+/g,' ').trim() : '(无 check_msg)';
+  var t = document.querySelector('input[name="cf-turnstile-response"]');
+  out.token = t ? String((t.value||'').length) : '(无 token 输入框)';
+  var all = document.querySelectorAll('iframe');
+  for (var i=0;i<all.length;i++){
+    var r = all[i].getBoundingClientRect();
+    out.iframes.push({src:(all[i].src||'').slice(0,110),
+                      x:Math.round(r.x), y:Math.round(r.y),
+                      w:Math.round(r.width), h:Math.round(r.height)});
+  }
+  var host = document.getElementById('turnstile') || document.querySelector('.cf-turnstile');
+  if (host) {
+    var hr = host.getBoundingClientRect();
+    out.host = {x:Math.round(hr.x), y:Math.round(hr.y),
+                w:Math.round(hr.width), h:Math.round(hr.height),
+                shadow: host.shadowRoot ? 'yes' : 'no'};
+  } else { out.host = null; }
+} catch (e) { out.err = String(e); }
+return JSON.stringify(out);
+"""
+
+    def _check_msg(self, page):
+        # 只读 #check_msg 的「渲染后文本」，不能拿页面 HTML 判断状态
+        # —— 门页面的 <script> 源码里就写着"验证组件加载失败/人机验证失败"，
+        #    用 HTML 判断会永久误报，导致一直刷新、Turnstile 永远没机会完成。
+        try:
+            return (page.run_js(self._STATE_JS) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "读取 check_msg 失败: %r" % exc)
+            return ""
+
+    def _read_token(self, page):
+        """读 Turnstile 已经把 token 塞回来的隐藏域（拿到就能自己交给服务端）。"""
+        try:
+            return (page.run_js(self._TOKEN_JS) or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _classify_msg(msg):
+        if not msg:
+            return "unknown"
+        if "正在校验" in msg:
+            return "verifying"
+        if "校验成功" in msg:
+            return "success"
+        if "请完成上方人机验证" in msg:
+            return "interaction_required"
+        if "人机验证失败" in msg:
+            return "rejected"
+        if "验证组件加载失败" in msg:
+            return "widget_error"
+        if "验证已过期" in msg:
+            return "expired"
+        if "验证超时" in msg:
+            return "timeout"
+        if "网络异常" in msg:
+            return "network_error"
+        if "检查" in msg and "安全性" in msg:
+            return "idle"
+        return "other"
+
+    def _human_click(self, page, x, y):
+        """
+        像人一样点击：先分几步把鼠标移过去，再按下、松开。
+        Turnstile 对「凭空出现在目标点的一次点击」打分很低。
+        """
+        sx, sy = max(0.0, x - 160), max(0.0, y - 90)
+        steps = 8
+        for i in range(1, steps + 1):
+            ix = sx + (x - sx) * i / float(steps)
+            iy = sy + (y - sy) * i / float(steps)
+            page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved",
+                         x=int(ix), y=int(iy), button="none", buttons=0)
+            time.sleep(0.03)
+        time.sleep(0.15)
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved",
+                     x=int(x), y=int(y), button="none", buttons=0)
+        time.sleep(0.1)
+        page.run_cdp("Input.dispatchMouseEvent", type="mousePressed",
+                     x=int(x), y=int(y), button="left", buttons=1, clickCount=1)
+        time.sleep(0.08)
+        page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
+                     x=int(x), y=int(y), button="left", buttons=0, clickCount=1)
+
+    def _dump_gate_debug(self, page, note=""):
+        """把门页面的关键状态落盘成 gate_debug.txt，CI 里能当 Artifact 下载下来看。"""
+        try:
+            raw = page.run_js(self._DIAG_JS)
+        except Exception as exc:  # noqa: BLE001
+            raw = "run_js 失败: %r" % exc
+        try:
+            with open(os.path.join(os.getcwd(), "gate_debug.txt"), "a",
+                      encoding="utf-8") as fh:
+                fh.write("[%s] %s\n%s\n\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                              note, raw))
+        except Exception:  # noqa: BLE001
+            pass
+        return raw
+
+    def _try_click_turnstile(self, page):
+        """
+        触发 Turnstile 的复选框。
+
+        复选框本体在 **跨域 iframe**（challenges.cloudflare.com）里，坐标点击是唯一
+        能碰到它的手段；DrissionPage 的元素点击对跨域 iframe 通常无效，所以放在后面兜。
+        三种策略都会打 INFO 日志 —— 之前这里全是 debug，导致 CI 日志里看不出
+        「到底有没有在点」，白排查了很久。
+        """
+        raw = None
+        try:
+            raw = page.run_js(self._GBOX_JS)
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "读取 Turnstile widget 位置失败: %r" % exc)
+
+        box = None
+        if raw:
+            try:
+                box = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:  # noqa: BLE001
+                box = None
+
+        if not box or not box.get("w"):
+            diag = self._dump_gate_debug(page, "定位 Turnstile 失败")
+            self._log("warning",
+                      "未能定位 Turnstile widget（what=%s, iframes=%s）"
+                      % ((box or {}).get("what", "?"), (box or {}).get("iframes", raw)))
+            self._log("warning", "诊断快照: %s" % (diag or "")[:300])
+            return False
+
+        what = box.get("what", "iframe")
+        cx, cy = box["x"] + 30, box["y"] + box["h"] / 2.0
+
+        # 策略 1：CDP 真人轨迹坐标点击（跨域 iframe 内唯一可靠的办法）
+        try:
+            self._human_click(page, cx, cy)
+            self._log("info", "已点击 Turnstile 复选框 (%d, %d) ｜ 匹配=%s ｜ 位置 "
+                              "(%.0f, %.0f) %.0fx%.0f"
+                      % (cx, cy, what, box["x"], box["y"], box["w"], box["h"]))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "坐标点击失败: %r" % exc)
+
+        # 策略 2：DrissionPage 元素点击
+        for selector in ('css:iframe[src*="challenges.cloudflare.com"]',
+                         "css:#turnstile", "css:.cf-turnstile"):
+            try:
+                el = page.ele(selector, timeout=2)
+            except Exception:  # noqa: BLE001
+                el = None
+            if not el:
+                continue
+            try:
+                el.click()
+                self._log("info", "已通过元素点击 Turnstile（%s）" % selector)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self._log("warning", "元素点击失败（%s）: %r" % (selector, exc))
+
+        # 策略 3：键盘激活（复选框可聚焦，空格能勾选）
+        try:
+            page.run_cdp("Input.dispatchMouseEvent", type="mousePressed",
+                         x=int(cx), y=int(cy), button="left", buttons=1, clickCount=1)
+            page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
+                         x=int(cx), y=int(cy), button="left", buttons=0, clickCount=1)
+            for key in ("Tab", " "):
+                page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key=key,
+                             code="Space" if key == " " else key)
+                time.sleep(0.1)
+                page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=key,
+                             code="Space" if key == " " else key)
+                time.sleep(0.1)
+            self._log("info", "已尝试键盘激活 Turnstile 复选框")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "键盘激活失败: %r" % exc)
+
+        return False
+
+    def _read_cookies(self, page):
+        """多版本兼容地读浏览器 Cookie。"""
+        for getter in (
+            lambda: page.cookies(all_domains=True),
+            lambda: page.cookies(),
+            lambda: page.get_cookies(all_domains=True),
+            lambda: page.get_cookies(),
+        ):
+            try:
+                cl = getter()
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                d = cl.as_dict()
+                if d:
+                    return d
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                d = {}
+                for c in cl:
+                    if isinstance(c, dict):
+                        n, v = c.get("name"), c.get("value")
+                    else:
+                        n, v = getattr(c, "name", None), getattr(c, "value", None)
+                    if n:
+                        d[n] = v
+                if d:
+                    return d
+            except Exception:  # noqa: BLE001
+                continue
+        return {}
+
+    def _submit_token(self, http, token):
+        """
+        自己把 token 交给站点校验接口。
+        好处：即使门页面自己的 axios 调用失败（跨域/CSP/时序），我们拿到 token 也能过门。
+        """
+        http.set_user_agent(CHROME_UA)
+        http.set_referer(self.forum_url)
+        url = "https://%s%s" % (self.hostname, VERIFY_PATH)
+        resp = http.post(url, data={"token": token}, headers={
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://%s" % self.hostname,
+        })
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            self._log("debug", "校验接口返回非 JSON: %s" % (resp.text or "")[:200])
+            return False
+        if data.get("code") == 200:
+            return True
+        self._log("debug", "校验接口拒绝: %s" % data)
+        return False
+
+    def _wait_pass(self, page, timeout, http=None):
+        """
+        轮询等待验证门通过。状态一律以 #check_msg 的渲染文本为准。
+        额外兜底：一旦抓到 Turnstile token，就自己用 HTTP 提交给站点校验接口。
+        """
+        deadline = time.time() + timeout
+        click_budget = 2
+        reloads = 0
+        max_reloads = 3
+        last_action = time.time()
+        last_logged = None
+        token_tried = False
+
+        while time.time() < deadline:
+            try:
+                html = page.html or ""
+            except Exception as exc:  # noqa: BLE001
+                self._log("debug", "读取页面失败: %r" % exc)
+                time.sleep(1)
+                continue
+
+            if not is_gated(html):
+                self._log("info", "验证门已通过（页面标题: %s）" % (page.title or "?"))
+                return True
+
+            msg = self._check_msg(page)
+            state = self._classify_msg(msg)
+            if state != last_logged:
+                self._log("info", "Turnstile 状态: %s | 页面提示: %s"
+                          % (state, msg[:70] or "(空)"))
+                last_logged = state
+
+            # 1) 提示要交互 → 点它
+            if state == "interaction_required" and click_budget > 0:
+                if self._try_click_turnstile(page):
+                    click_budget -= 1
+                    last_action = time.time()
+                    time.sleep(3)
+                    continue
+
+            # 2) 只要拿到 token，就自己提交（不依赖页面自己的 axios）
+            if http is not None and not token_tried:
+                token = self._read_token(page)
+                if token:
+                    token_tried = True
+                    self._log("info", "抓到 Turnstile token（%d 字符），改由 HTTP 提交校验接口"
+                              % len(token))
+                    try:
+                        self._merge_browser_cookies(page, http)
+                        if self._submit_token(http, token):
+                            self._log("info", "站点校验通过（code=200）")
+                            self._passed_via_http = True
+                            time.sleep(1)
+                            resp = http.get(self.forum_url)
+                            if looks_like_forum(resp.text or ""):
+                                self._log("info", "HTTP 引擎已过门（%d 字节）"
+                                          % len(resp.text or ""))
+                                return True
+                    except Exception as exc:  # noqa: BLE001
+                        self._log("warning", "token 提交失败: %r" % exc)
+
+            # 3) 真错误 → 刷新重来
+            if state in ("rejected", "expired", "widget_error", "timeout", "network_error"):
+                if state == "widget_error":
+                    self._log("warning",
+                              "Turnstile 组件加载失败，通常说明浏览器访问不了 "
+                              "challenges.cloudflare.com。本地（国内网络）请设置 "
+                              "GM_CHROME_PROXY=http://127.0.0.1:7897；GitHub Actions 无需代理")
+                if reloads < max_reloads and (time.time() - last_action) > 8:
+                    reloads += 1
+                    self._log("info", "刷新页面重新挑战（第 %d/%d 次）" % (reloads, max_reloads))
+                    try:
+                        page.refresh()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    last_action = time.time()
+                    last_logged = None
+                    token_tried = False
+                    time.sleep(4)
+                    continue
+
+            # 4) 长时间无进展 → 刷新一次，避免卡死
+            if (time.time() - last_action) > 40 and reloads < max_reloads:
+                reloads += 1
+                self._log("info", "等待较久仍无进展，刷新重试（第 %d/%d 次）"
+                          % (reloads, max_reloads))
+                try:
+                    page.refresh()
+                except Exception:  # noqa: BLE001
+                    pass
+                last_action = time.time()
+                last_logged = None
+                token_tried = False
+
+            time.sleep(1)
+
+        # 超时也要留下现场，否则 CI 里只能看到「失败」两个字
+        self._dump_gate_debug(page, "破门超时（%.0f 秒内未通过）" % timeout)
+        return False
+
+    def _merge_browser_cookies(self, page, http):
+        cookies = self._read_cookies(page)
+        if cookies:
+            http.set_cookies(cookies)
+            http.set_user_agent(CHROME_UA)
+        return cookies
+
+    def solve_with_browser(self, http):
+        """起浏览器过 Turnstile，成功后把 Cookie / UA 交给 http。"""
+        try:
+            page = self._launch_browser()
+        except Exception as exc:  # noqa: BLE001
+            raise GateError(
+                "浏览器启动失败: %r\n"
+                "  排查建议：\n"
+                "  1) 确认已安装 Chrome（CI 用 ubuntu-latest 自带 google-chrome）\n"
+                "  2) 用 GM_CHROME_PATH 显式指定 chrome 可执行文件路径\n"
+                "  3) 本地 Windows 可先跑 `python gm_gate.py` 看探测结果\n"
+                "  4) 若以 root 运行，设置 GM_CHROME_NO_SANDBOX=1" % exc)
+
+        if self.headless:
+            self._log("warning", "当前是无头模式。实测无头几乎必失败，"
+                                 "CI 请用 `xvfb-run -a python gamemale.py` 提供虚拟显示器")
+
+        for attempt in range(1, self.browser_attempts + 1):
+            self._log("info", "浏览器破门 第 %d/%d 次尝试..." % (attempt, self.browser_attempts))
+            try:
+                page.get(self.forum_url)
+            except Exception as exc:  # noqa: BLE001
+                self._log("warning", "打开页面失败: %r" % exc)
+                time.sleep(2)
+                continue
+
+            if self.manual:
+                self._log("info", "人工模式：请在浏览器窗口里手动完成人机验证（最多 %d 秒）"
+                          % self.solve_timeout)
+
+            if self._wait_pass(page, self.solve_timeout, http=http):
+                return self._harvest(page, http, replace=not self._passed_via_http)
+
+            self._log("warning", "第 %d 次仍在验证门内，准备重试" % attempt)
+            try:
+                page.refresh()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(2)
+
+        raise GateError("浏览器连续 %d 次未能通过 Turnstile 验证门"
+                        "（提示：无头模式基本过不了，请用有头或 xvfb-run）"
+                        % self.browser_attempts)
+
+    def _harvest(self, page, http, replace=True):
+        """把浏览器的 Cookie 和 User-Agent 同步给 HTTP 引擎，并复验一次。"""
+        cookie_dict = self._read_cookies(page)
+        try:
+            ua = page.user_agent or CHROME_UA
+        except Exception:  # noqa: BLE001
+            ua = CHROME_UA
+
+        if replace:
+            http.clear_cookies()
+        n = http.set_cookies(cookie_dict)
+        http.set_user_agent(ua)
+        http.set_referer(self.forum_url)
+
+        names = ", ".join(sorted(cookie_dict.keys()))
+        self._log("info", "已接管浏览器会话：Cookie %d 项 / UA %s" % (n, ua[:60]))
+        self._log("debug", "Cookie 名单: %s" % names)
+
+        if self.export_cookie and cookie_dict:
+            self.gate_cookie_blob = encode_cookie_blob(cookie_dict, ua)
+            self._log("info", "已导出 Cookie 串（%d 字符），可存成 GitHub Secret %s"
+                      % (len(self.gate_cookie_blob), COOKIE_ENV))
+            print("\n===== 复制下面这一行，存成 GitHub Secret %s =====" % COOKIE_ENV)
+            print(self.gate_cookie_blob)
+            print("===== 结束 =====\n")
+
+        try:
+            resp = http.get(self.forum_url)
+            if looks_like_forum(resp.text or ""):
+                self._log("info", "HTTP 引擎复验通过（HTTP %s, %d 字节）"
+                          % (resp.status_code, len(resp.text or "")))
+                self.state = OPEN
+                return True
+            self._log("warning", "Cookie 已接管，但 HTTP 复验仍未通过（HTTP %s, %d 字节）"
+                      % (resp.status_code, len(resp.text or "")))
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "HTTP 复验异常: %r" % exc)
+        return False
+
+    # -- 打码平台兜底 -----------------------------------------------------
+
+    def solve_with_capsolver(self, http, client_key):
+        """
+        可选兜底：用打码平台（CapSolver）直接取 Turnstile token，然后纯 HTTP 提交。
+        站点校验接口 plugin.php?id=dev8133_cloudflare 本身不受门保护，所以这条路可行。
+        """
+        import urllib.request
+
+        create = {
+            "clientKey": client_key,
+            "task": {
+                "type": "AntiTurnstileTaskProxyLess",
+                "websiteURL": self.forum_url,
+                "websiteKey": TURNSTILE_SITEKEY,
+            },
+        }
+        self._log("info", "向 CapSolver 提交 Turnstile 任务...")
+        token = None
+        task_id = None
+        for _ in range(60):
+            if task_id is None:
+                req = urllib.request.Request(
+                    "https://api.capsolver.com/createTask",
+                    data=json.dumps(create).encode("utf-8"),
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    res = json.loads(r.read().decode("utf-8"))
+                if res.get("errorId"):
+                    raise GateError("CapSolver 创建任务失败: %s" % res.get("errorDescription"))
+                task_id = res.get("taskId")
+                if not task_id:
+                    time.sleep(5)
+                    continue
+                continue
+
+            body = json.dumps({"clientKey": client_key, "taskId": task_id}).encode("utf-8")
+            req2 = urllib.request.Request(
+                "https://api.capsolver.com/getTaskResult", data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req2, timeout=30) as r:
+                res2 = json.loads(r.read().decode("utf-8"))
+            if res2.get("status") == "ready":
+                sol = res2.get("solution") or {}
+                token = sol.get("token") or sol.get("gRecaptchaResponse")
+                if token:
+                    break
+            elif res2.get("errorId"):
+                raise GateError("CapSolver 取结果失败: %s" % res2.get("errorDescription"))
+            time.sleep(5)
+
+        if not token:
+            raise GateError("CapSolver 未在时限内返回 token")
+
+        self._log("info", "已取得 Turnstile token（%d 字符），用 HTTP 提交站点校验接口" % len(token))
+        if not self._submit_token(http, token):
+            raise GateError("站点校验未通过（token 被拒）")
+        self._log("info", "站点校验通过（code=200）")
+
+        resp2 = http.get(self.forum_url)
+        if looks_like_forum(resp2.text or ""):
+            self.state = OPEN
+            self._log("info", "HTTP 引擎复验通过（%d 字节）" % len(resp2.text or ""))
+            if self.export_cookie:
+                d = http.cookie_dict()
+                if d:
+                    self.gate_cookie_blob = encode_cookie_blob(d, CHROME_UA)
+                    print("\n===== Cookie 串（存成 GitHub Secret %s）=====" % COOKIE_ENV)
+                    print(self.gate_cookie_blob)
+                    print("===== 结束 =====\n")
+            return True
+        raise GateError("校验通过但业务页仍被拦截（HTTP %s, %d 字节）"
+                        % (resp2.status_code, len(resp2.text or "")))
+
+    # -- 统一出口 ---------------------------------------------------------
+
+    # -- 路线 A：用户自己的登录 Cookie（最稳，零浏览器）------------------
+
+    @staticmethod
+    def spider_ua():
+        """取蜘蛛 UA。可用 GM_SPIDER_UA 覆盖；默认 Baiduspider（实测最稳）。"""
+        custom = (os.getenv(SPIDER_UA_ENV) or "").strip()
+        if custom:
+            return custom
+        return dict(SPIDER_UAS)["Baiduspider"]
+
+    def try_user_cookie(self, http):
+        """
+        用 `GM_USER_COOKIE` 里的登录 Cookie + 蜘蛛 UA 直接开跑。
+
+        为什么这条路最稳：
+          * 蜘蛛 UA 让插件的门形同虚设（POST 也放行，只挡 misc.php）
+          * 登录态由 Cookie 提供，**不需要验证码图片**（那正是被 403 的那个接口）
+          * 不启动浏览器、不需要打码平台、不受出口 IP 信誉影响
+
+        代价：Cookie 是你在自己浏览器里登录后复制出来的，30 天后要换一次。
+        返回 True 表示可用。
+        """
+        raw = os.getenv(USER_COOKIE_ENV)
+        if not raw or not raw.strip():
+            self.user_cookie_state = "absent"
+            return False
+
+        cookies = parse_cookie_header(raw)
+        fp = cookie_fingerprint(raw)
+        if not cookies:
+            self.user_cookie_state = "broken"
+            self._log("error",
+                      "%s 解析后是空的（长度=%d，指纹=%s）。"
+                      "请确认粘贴的是形如 `name=value; name=value` 的一整行。"
+                      % (USER_COOKIE_ENV, len(raw.strip()), fp))
+            return False
+
+        # 指纹必须能在本地与 CI 日志之间对上，否则就是 Secret 没生效 / 粘漏了
+        self._log("info", "%s: 长度=%d 指纹=%s 解析出 %d 项 Cookie"
+                  % (USER_COOKIE_ENV, len(raw.strip()), fp, len(cookies)))
+        if not any(k.endswith("_auth") or k.endswith("_saltkey") for k in cookies):
+            self._log("warning",
+                      "Cookie 里没有 `*_auth`（Discuz 登录凭据），"
+                      "多半只复制了部分 Cookie，登录态可能不被识别")
+
+        ua = self.spider_ua()
+        # 失败时必须把 UA 还原，否则会把「借来的蜘蛛 UA」留给后面的 classify，
+        # 让 classify 误判成「OPEN —— 普通 UA 可直连」（这个坑实测踩到过）。
+        orig_ua = http.user_agent
+
+        http.clear_cookies()
+        http.set_user_agent(ua)
+        http.set_cookies(cookies)
+        http.set_referer(self.forum_url)
+        self._log("info", "发现 %s（%d 项 Cookie），按「用户 Cookie 模式」直连"
+                  % (USER_COOKIE_ENV, len(cookies)))
+        self._log("debug", "Cookie 名单: %s" % ", ".join(sorted(cookies)))
+
+        uid = None
+        gated = False
+        # 多取一个页面交叉验证，避免「某个页面没印 discuz_uid」被误判成 Cookie 失效
+        for path in ("/home.php?mod=spacecp", "/forum.php"):
+            try:
+                resp = http.get(self.url(path))
+            except Exception as exc:  # noqa: BLE001
+                self._log("warning", "用户 Cookie 验证请求异常（%s）: %r" % (path, exc))
+                continue
+            body = resp.text or ""
+            if is_gated(body):
+                gated = True
+                continue
+            uid = detect_uid(body)
+            if uid:
+                break
+
+        if gated and not uid:
+            self.user_cookie_state = "gated"
+            self._log("warning",
+                      "用户 Cookie 模式下仍被拦门 —— 说明 GM_SPIDER_UA 这个 UA "
+                      "不在站点白名单里（请勿随意改它）")
+            http.clear_cookies()
+            http.set_user_agent(orig_ua)
+            return False
+
+        if uid:
+            self.user_cookie_state = "ok"
+            self._log("info", "用户 Cookie 有效，已登录 uid=%d —— 跳过浏览器与验证码" % uid)
+            self.state = OPEN
+            self.gate_mode = USER_COOKIE_MODE
+            self.logged_uid = uid
+            return True   # 成功时保留蜘蛛 UA（后续请求都要用它）
+
+        self.user_cookie_state = "expired"
+        self._log("error",
+                  "用户 Cookie 已失效（服务端认为未登录，指纹=%s）。"
+                  "请重新在浏览器登录 %s 后复制新的 Cookie 串，更新仓库 Secret %s"
+                  % (fp, self.hostname, USER_COOKIE_ENV))
+        http.clear_cookies()
+        http.set_user_agent(orig_ua)
+        return False
+
+    def try_preset_cookie(self, http):
+        """
+        先试 GM_GATE_COOKIE（CI 上可以完全跳过浏览器）。
+
+        原理：过门后站点会种下 Cookie `TVj0_2132_cloudflare_check`（以及配套的 saltkey），
+        带着它访问任何被门保护的页面都会直接放行。这个 Cookie 是长期有效的，
+        所以「本地破门一次 → 把 Cookie 串存进 GitHub Secret → CI 直接复用」完全可行。
+        """
+        blob = os.getenv(COOKIE_ENV)
+        if not blob:
+            return False
+        try:
+            ua, cookies = decode_cookie_blob(blob)
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "预置 Cookie 解析失败：%r" % exc)
+            return False
+        if not cookies:
+            return False
+        self._log("info", "发现预置 Cookie（%s），先试它" % COOKIE_ENV)
+        http.clear_cookies()
+        http.set_user_agent(ua)
+        http.set_cookies(cookies)
+        try:
+            resp = http.get(self.forum_url)
+            if looks_like_forum(resp.text or ""):
+                self._log("info", "预置 Cookie 有效，跳过浏览器（HTTP %s, %d 字节）"
+                          % (resp.status_code, len(resp.text or "")))
+                self.state = OPEN
+                return True
+            self._log("warning", "预置 Cookie 已失效，改为现场破门")
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "预置 Cookie 验证异常: %r" % exc)
+        http.clear_cookies()
+        return False
+
+    def ensure_access(self, http):
+        """
+        保证 http 引擎可以正常访问站点。
+        :return: 使用的方式（user_cookie / cookie / open / spider / browser / capsolver）
+        """
+        # 路线 A：用户自己的登录 Cookie（蜘蛛 UA，全程不碰 Turnstile）—— 最稳，优先
+        if self.try_user_cookie(http):
+            return USER_COOKIE_MODE
+
+        # 配了却不能用 —— 必须立刻停，否则会白烧几分钟去开浏览器，最后给一个看不懂的报错
+        if self.user_cookie_state in ("broken", "expired", "gated"):
+            reason = {
+                "broken": "内容解析不出任何 Cookie（多半是粘贴时截断了）",
+                "expired": "Cookie 已失效（服务端认为未登录，通常是超过约 30 天或改了密码）",
+                "gated": "带上它仍被拦门（GM_SPIDER_UA 被改动过？）",
+            }[self.user_cookie_state]
+            raise GateError(
+                "%s 已配置但不可用：%s\n"
+                "  处理：本地重跑 `python get_user_cookie.py` 生成新的串，"
+                "更新仓库 Secret %s（注意 Secret 名不要写错）" % (USER_COOKIE_ENV, reason, USER_COOKIE_ENV))
+
+        self._log("warning",
+                  "未配置 %s —— 将走「浏览器破门」。"
+                  "实测：GitHub Runner 的机房 IP 会被 Turnstile 降级，"
+                  "这道门在 CI 上几乎不可能自动通过（日志里会一直停在 interaction_required）。"
+                  "强烈建议配置 %s。" % (USER_COOKIE_ENV, USER_COOKIE_ENV))
+
+        # 路线 B：之前破门导出的放行 Cookie
+        if self.try_preset_cookie(http):
+            return "cookie"
+
+        state = self.classify(http)
+        if state == OPEN:
+            return OPEN
+
+        solver = (os.getenv("GM_SOLVER") or "").strip().lower()
+        cap_key = os.getenv("CAPSOLVER_KEY")
+        if solver == "capsolver" or (solver == "" and cap_key
+                                     and os.getenv("GM_PREFER_CAPSOLVER")):
+            self._log("info", "使用打码平台（CapSolver）破门")
+            try:
+                if self.solve_with_capsolver(http, cap_key):
+                    return "capsolver"
+            except Exception as exc:  # noqa: BLE001
+                self._log("error", "打码平台破门失败: %r" % exc)
+
+        try:
+            if self.solve_with_browser(http):
+                return "browser"
+        except GateError as exc:
+            self._log("error", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self._log("error", "浏览器破门异常: %r" % exc)
+
+        # 浏览器失败后，若配了打码平台再兜一次
+        if cap_key and solver not in ("capsolver", "browser"):
+            try:
+                self._log("warning", "浏览器破门失败，改用打码平台兜底")
+                if self.solve_with_capsolver(http, cap_key):
+                    return "capsolver"
+            except Exception as exc:  # noqa: BLE001
+                self._log("error", "打码平台兜底也失败: %r" % exc)
+
+        # 最后实在不行，降级为爬虫白名单（只能读，登录必失败）
+        if state == SPIDER_OK or self.state == SPIDER_OK:
+            self._log("warning", "破门失败，降级为爬虫白名单 UA（只能读公开页面，无法登录）")
+            spider_ua = dict(SPIDER_UAS).get(self.spider_ua_name or "Baiduspider")
+            if spider_ua:
+                http.set_user_agent(spider_ua)
+                return SPIDER_OK
+
+        raise GateError(
+            "无法通过站点验证门，本次任务中止。\n"
+            "  站点装的是 dev8133_cloudflare（Turnstile 人机验证）。已经穷尽以下手段：\n"
+            "    1) 爬虫 UA 白名单   —— 只能读，拿不到登录验证码，无法登录\n"
+            "    2) 浏览器过 Turnstile —— 机房 IP 被降级，实测必停在 interaction_required\n"
+            "    3) 打码平台         —— 未配置 CAPSOLVER_KEY\n"
+            "  唯一实测可行且免费的做法：配置 %s（详见 README「第三步」）。\n"
+            "  诊断明细已写入 gate_debug.txt（CI 的 Artifact 里可下载）。" % USER_COOKIE_ENV)
+
+    # -- 登录链路自检（不需要账号密码）-----------------------------------
+
+    def probe_login(self, http):
+        """
+        过门之后，验证「登录页 + 验证码图片」这条链路在纯 HTTP 下是否真的通。
+
+        关键点（实测）：登录页里**没有** name="seccodehash" 的隐藏域，
+        真正的 idhash 藏在 JavaScript 调用里：
+            updateseccode('cSBPIt5f', '<div class="rfm">...', 'member::logging')
+        原项目写死 idhash=cSA —— 所以每次取验证码都 403。这里必须动态解析。
+        """
+        result = {"login_page": False, "idhash": None, "seccode_image": False,
+                  "image_bytes": 0, "ocr": None, "note": ""}
+        login_url = "https://%s/member.php?mod=logging&action=login" % self.hostname
+        ref = "https://%s/" % self.hostname
+
+        try:
+            r = http.get(login_url, headers={"Referer": ref})
+        except Exception as exc:  # noqa: BLE001
+            result["note"] = "请求登录页异常: %r" % exc
+            return result
+        html = r.text or ""
+        if is_gated(html):
+            result["note"] = "登录页仍被验证门拦住"
+            return result
+        result["login_page"] = True
+
+        m = re.search(r"updateseccode\('([A-Za-z0-9]+)'", html)
+        if not m:
+            m = re.search(r'id="seccode_([A-Za-z0-9]+)"', html)
+        if not m:
+            m = re.search(r'name="seccodehash"[^>]*value="([^"]+)"', html)
+        if not m:
+            result["note"] = "登录页里找不到 seccode idhash（可能本次不需要验证码）"
+            return result
+        idhash = m.group(1)
+        result["idhash"] = idhash
+
+        img_url = ("https://%s/misc.php?mod=seccode&update=%d&idhash=%s&modid=member::logging"
+                   % (self.hostname, int(time.time() * 1000) % 1000000, idhash))
+        try:
+            r2 = http.get(img_url, headers={
+                "Referer": login_url,
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"})
+        except Exception as exc:  # noqa: BLE001
+            result["note"] = "请求验证码图片异常: %r" % exc
+            return result
+
+        ct = r2.headers.get("Content-Type", "")
+        if r2.status_code == 200 and "image" in ct.lower() and r2.content:
+            result["seccode_image"] = True
+            result["image_bytes"] = len(r2.content)
+            try:
+                import ddddocr
+                ocr = ddddocr.DdddOcr(show_ad=False)
+                result["ocr"] = ocr.classification(r2.content)
+            except Exception as exc:  # noqa: BLE001
+                result["note"] = "验证码图片已拿到，但 ddddocr 不可用: %r" % exc
+        else:
+            result["note"] = "验证码图片拿不到：HTTP %s / %d 字节 / %s" % (
+                r2.status_code, len(r2.content), ct)
+        return result
+
+    def close(self):
+        if self.page is not None:
+            try:
+                self.page.quit()
+                self._log("info", "浏览器已关闭")
+            except Exception:  # noqa: BLE001
+                pass
+            self.page = None
+
+
+# ---------------------------------------------------------------- 带门保护的会话
+
+
+class GatedSession:
+    """
+    包一层：每次请求后自动检查是否又被门拦住；若是，则重新破门并重放该请求。
+    这样即使站点在会话中途让验证过期，业务也不会无声失败。
+    """
+
+    def __init__(self, http, gate, logger=None, max_resolve=2):
+        self.http = http
+        self.gate = gate
+        self.logger = logger
+        self.max_resolve = max_resolve
+
+    def _log(self, level, msg):
+        if self.logger:
+            getattr(self.logger, level)(msg)
+
+    def _request(self, method, url, **kw):
+        attempt = 0
+        while True:
+            resp = getattr(self.http, method)(url, **kw)
+            text = resp.text or ""
+            if not is_gated(text):
+                return resp
+            attempt += 1
+            if attempt > self.max_resolve:
+                self._log("error", "请求 %s 反复被验证门拦截，放弃" % url)
+                return resp
+            self._log("warning", "请求被验证门拦截，重新破门后重试（第 %d 次）: %s"
+                      % (attempt, url))
+            self.gate.ensure_access(self.http)
+            self.http.set_referer("https://%s/" % self.http.hostname)
+
+    def get(self, url, **kw):
+        return self._request("get", url, **kw)
+
+    def post(self, url, **kw):
+        return self._request("post", url, **kw)
+
+
+# ---------------------------------------------------------------- 命令行诊断
+
+
+def _build_logger(verbose=False):
+    import logging
+    logger = logging.getLogger("GateProbe")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)-10s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    logger.addHandler(handler)
-    logger.propagate = False
+    if not logger.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s",
+                                         datefmt="%H:%M:%S"))
+        logger.addHandler(h)
     return logger
 
 
-def env(*names, **kw):
-    """按顺序取第一个非空环境变量。"""
-    default = kw.get("default")
-    for n in names:
-        v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    return default
-
-
-def parse_uids(raw):
-    if not raw:
-        return list(DEFAULT_UIDS)
-    out = []
-    for part in re.split(r"[,\s;]+", raw.strip()):
-        if part.isdigit():
-            out.append(int(part))
-    return out or list(DEFAULT_UIDS)
-
-
-# =============================================================== 主体
-
-
-class Gamemale:
-
-    def __init__(self, username, password, questionid="0", answer=None,
-                 verbose=False, hostname=DEFAULT_HOST, run_mode="full",
-                 uids=None, chrome_path=None):
-        self.verbose = verbose
-        self.hostname = hostname
-        self.run_mode = (run_mode or "full").lower()
-        self.uids = uids or list(DEFAULT_UIDS)
-
-        self.main_logger = setup_logger("GameMale", verbose)
-        self.login_logger = setup_logger("登录", verbose)
-        self.sign_logger = setup_logger("签到", verbose)
-        self.exchange_logger = setup_logger("抽奖", verbose)
-        self.task_logger = setup_logger("日常任务", verbose)
-        self.notice_logger = setup_logger("通知", verbose)
-
-        self.username = str(username)
-        self.password = str(password)
-        self.questionid = str(questionid or "0")
-        self.answer = str(answer or "")
-
-        self.post_formhash = None
-        self.logged_in = False
-        self.gate_mode = "unknown"
-        self.fatal_error = None
-        self.spider_mode = False   # 蜘蛛 UA + 用户 Cookie：misc.php 不可用，登录流程整体跳过
-
-        self.sign_result = "未执行"
-        self.exchange_result = "未执行"
-        self.task_result = "未执行"
-        self.assets_report = "未抓取"
-        self.assets_ok = False
-
-        # HTTP 引擎（优先 curl_cffi，抗 TLS 指纹识别）
-        self.http = HttpEngine(hostname, self.main_logger)
-        self.main_logger.info("HTTP 引擎: %s" % self.http.kind)
-
-        # 验证门处理
-        self.gate = GateKeeper(hostname, self.main_logger, browser_path=chrome_path)
-        self.sess = GatedSession(self.http, self.gate, self.main_logger)
-
-        # 验证码识别
-        self.ocr = None
-        if ddddocr is None:
-            self.login_logger.warning("ddddocr 不可用（%s），若站点要求验证码将无法登录"
-                                      % _DDDDOCR_IMPORT_ERROR)
-        else:
-            try:
-                self.ocr = ddddocr.DdddOcr(show_ad=False)
-            except Exception as exc:  # noqa: BLE001
-                self.login_logger.warning("ddddocr 初始化失败: %r" % exc)
-
-    # ---------------------------------------------------------- 基础
-
-    def _url(self, path):
-        return "https://%s%s" % (self.hostname, path)
-
-    def refresh_formhash(self):
-        """从论坛页面提取全局 formhash（所有写操作都要带）。"""
-        text = self.sess.get(self._url("/forum.php")).text or ""
-        m = re.search(r'<input type="hidden" name="formhash" value="(.+?)"', text)
-        if m:
-            self.post_formhash = m.group(1)
-            return self.post_formhash
-        return None
-
-    # ---------------------------------------------------------- 过门
-
-    def connect(self):
-        """接管站点访问（必要时用浏览器过 Turnstile 验证门）。"""
-        self.main_logger.info("=== 检查站点验证门 ===")
-        try:
-            self.gate_mode = self.gate.ensure_access(self.http)
-        except GateError as exc:
-            self.fatal_error = "无法通过站点验证门: %s" % exc
-            self.main_logger.error(self.fatal_error)
-            return False
-        self.main_logger.info("验证门处理完成，模式: %s" % self.gate_mode)
-        self.http.set_referer(self._url("/forum.php"))
-
-        if self.gate_mode == USER_COOKIE_MODE:
-            # 路线 A：Cookie 已经带着登录态，后面直接跳过登录
-            self.logged_in = True
-            self.spider_mode = True
-            self.http.set_referer(self._url("/forum.php"))
-            if not self.refresh_formhash():
-                self.main_logger.warning("用户 Cookie 模式下未取到 formhash，写操作可能失败")
-            return True
-
-        if self.gate_mode == "spider":
-            # 爬虫白名单能读能写，但 misc.php 整个文件 403 —— 所以拿不到登录验证码。
-            # 没有登录 Cookie 时这里就是死路，必须点明原因。
-            self.fatal_error = (
-                "站点验证门只放行了爬虫 UA，登录验证码接口 misc.php 对爬虫 UA 返回 403，"
-                "无法完成登录。\n"
-                "  两条出路：\n"
-                "    1) 推荐：设置 %s（你自己浏览器的登录 Cookie），全程不必碰 Turnstile；\n"
-                "    2) 或者排查浏览器破门为何没生效（GM_HEADLESS / xvfb / GM_CHROME_PATH），"
-                "或配置 CAPSOLVER_KEY 走打码平台。" % USER_COOKIE_ENV)
-            self.main_logger.error(self.fatal_error)
-            return False
-        return True
-
-    # ---------------------------------------------------------- 登录
-
-    @staticmethod
-    def _extract_login_fields(html):
-        """
-        解析登录页表单要素。
-
-        ⚠️ 关键实测结论：本站登录页**没有** name="seccodehash" 的隐藏域，
-        真正的 idhash 藏在页面底部的 JavaScript 调用里：
-
-            <span id="seccode_cSBPIt5f"></span>
-            <script>updateseccode('cSBPIt5f', '<div class="rfm">…', 'member::logging');</script>
-
-        那对 input 是 updateseccode() 运行时才注入的。
-        原项目写死 idhash=cSA，所以取验证码图片永远 403（站点返回空 body 的 403）。
-        这里必须按优先级动态解析。
-        """
-        html = html or ""
-        out = {"loginhash": None, "formhash": None,
-               "seccodehash": None, "seccodemodid": None,
-               "has_seccode_input": False}
-
-        m = re.search(r'<div id="main_messaqge_(.+?)">', html)
-        if m:
-            out["loginhash"] = m.group(1)
-        m = re.search(r'name="formhash"\s+value="(.+?)"', html)
-        if m:
-            out["formhash"] = m.group(1)
-
-        # idhash 解析：三条路依次尝试
-        for pattern in (
-            r"updateseccode\('([A-Za-z0-9]+)'",            # 本站的真实形态
-            r'id="seccode_([A-Za-z0-9]+)"',
-            r'name="seccodehash"[^>]*value="([^"]+)"',
-        ):
-            m = re.search(pattern, html)
-            if m:
-                out["seccodehash"] = m.group(1)
-                break
-
-        m = re.search(r"updateseccode\('[A-Za-z0-9]+',\s*'[^']*',\s*'([^']+)'", html)
-        if not m:
-            m = re.search(r'name="seccodemodid"[^>]*value="([^"]+)"', html)
-        out["seccodemodid"] = m.group(1) if m else "member::logging"
-
-        # 有 idhash 就说明这次登录要过验证码
-        out["has_seccode_input"] = bool(out["seccodehash"]) or ("seccodeverify" in html)
-        return out
-
-    def _fetch_seccode(self, seccodehash, modid, max_retries=8):
-        """
-        拉取验证码图片并 OCR。
-
-        流程（对齐 Discuz 的 updateseccode() 实现）：
-          1) GET misc.php?mod=seccode&action=update&idhash=X&modid=Y  → 返回含
-             <img src="misc.php?mod=seccode&update=NNNN&idhash=X&modid=Y"> 的 HTML
-          2) 从里面抠出 update=NNNN，再 GET 图片
-          3) 拿到图 → ddddocr 识别
-          4) GET ...&action=check... 让服务端先校验一次，通过再拿去 POST 登录
-        第 2 步取不到 update 时，退回「随机 update 直取图片」。
-        """
-        if self.ocr is None:
-            return ""
-        modid = modid or "member::logging"
-        if self.spider_mode:
-            # 蜘蛛 UA 下 misc.php 整个文件被插件 403，取图必失败，直接点明不要白试 8 轮
-            self.login_logger.error(
-                "当前是蜘蛛 UA 模式，misc.php 被站点 403 封死，无法获取验证码图片。"
-                "请改用 GM_USER_COOKIE（自带登录态，无需验证码）")
-            return ""
-        if not seccodehash:
-            self.login_logger.error("没有 idhash，无法取验证码")
-            return ""
-        self.login_logger.info("开始识别验证码（idhash=%s, 最多 %d 次）" % (seccodehash, max_retries))
-        referer = self._url("/member.php?mod=logging&action=login")
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                img = b""
-
-                # --- 第 1 步：问服务端要一次 update 串 -------------------
-                update_url = self._url(
-                    "/misc.php?mod=seccode&action=update&idhash=%s&modid=%s&_=%d"
-                    % (seccodehash, modid, int(time.time() * 1000)))
-                try:
-                    update_text = self.sess.get(
-                        update_url, headers={"Referer": referer}).text or ""
-                except Exception:  # noqa: BLE001
-                    update_text = ""
-                m = re.search(r"update=(\w+)&idhash=", update_text)
-
-                # --- 第 2 步：取图片 --------------------------------------
-                if m:
-                    code_url = self._url(
-                        "/misc.php?mod=seccode&update=%s&idhash=%s&modid=%s"
-                        % (m.group(1), seccodehash, modid))
-                else:
-                    code_url = self._url(
-                        "/misc.php?mod=seccode&update=%d&idhash=%s&modid=%s"
-                        % (int(time.time() * 1000) % 1000000, seccodehash, modid))
-
-                resp = self.sess.get(code_url, headers={
-                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-                    "Referer": referer,
-                })
-                ct = (resp.headers.get("Content-Type") or "").lower()
-                if "image" in ct:
-                    img = resp.content or b""
-                if not img:
-                    self.login_logger.debug(
-                        "第 %d 次验证码图片为空（HTTP %s, %s）"
-                        % (attempt, resp.status_code, ct or "无 Content-Type"))
-                    time.sleep(0.5)
-                    continue
-
-                code = self.ocr.classification(img)
-                if not code:
-                    continue
-
-                check_url = self._url(
-                    "/misc.php?mod=seccode&action=check&inajax=1&modid=%s&idhash=%s&secverify=%s"
-                    % (modid, seccodehash, code))
-                if "succeed" in (self.sess.get(check_url, headers={
-                        "X-Requested-With": "XMLHttpRequest"}).text or ""):
-                    self.login_logger.info("验证码识别成功: %s（第 %d 次）" % (code, attempt))
-                    return code
-                self.login_logger.debug("第 %d 次识别结果 '%s' 未通过" % (attempt, code))
-            except Exception as exc:  # noqa: BLE001
-                self.login_logger.warning("验证码流程异常（第 %d 次）: %r" % (attempt, exc))
-            time.sleep(0.5)
-        self.login_logger.error("验证码识别失败")
-        return ""
-
-    def login(self):
-        self.login_logger.info("开始登录流程...")
-        login_page = self._url("/member.php?mod=logging&action=login")
-
-        # 密码有两种提交形态，必须都试：
-        #   Discuz 登录表单的 onsubmit 会调 pwmd5()，把明文密码就地换成 md5 再提交；
-        #   但服务端同时也接受明文（历史兼容）。所以第 1/3 轮用 md5，第 2 轮用明文。
-        pw_md5 = hashlib.md5(self.password.encode("utf-8")).hexdigest()
-        # loginfield 是「按哪个字段登录」（username / email），不是用户名本身。
-        # 上游原版填的是用户名，恰好被 Discuz 当成非 email 兜底成 username 才没炸。
-        login_field = (os.getenv("GM_LOGIN_FIELD") or "username").strip() or "username"
-
-        for round_no in range(1, 4):
-            html = self.sess.get(login_page).text or ""
-            f = self._extract_login_fields(html)
-            if not f["loginhash"] or not f["formhash"]:
-                self.login_logger.error(
-                    "第 %d 轮：登录页缺少 loginhash/formhash（%d 字节，仍在验证门内=%s）"
-                    % (round_no, len(html), is_gated(html)))
-                time.sleep(2)
-                continue
-
-            seccodehash = f["seccodehash"] or ""
-            modid = f["seccodemodid"] or "member::logging"
-            code = ""
-            if seccodehash:
-                code = self._fetch_seccode(seccodehash, modid)
-            else:
-                self.login_logger.warning("登录页未出现验证码 idhash，本次尝试不带验证码")
-
-            password_to_send = pw_md5 if round_no != 2 else self.password
-            login_url = self._url(
-                "/member.php?mod=logging&action=login&loginsubmit=yes&loginhash=%s&inajax=1"
-                % f["loginhash"])
-            form = {
-                "formhash": f["formhash"],
-                "referer": self._url("/"),
-                "loginfield": login_field,
-                "username": self.username,
-                "password": password_to_send,
-                "questionid": self.questionid,
-                "answer": self.answer,
-                "cookietime": 2592000,
-                "seccodehash": seccodehash,
-                "seccodemodid": modid,
-                "seccodeverify": code,
-            }
-            try:
-                resp_text = self.sess.post(login_url, data=form, headers={
-                    "Referer": login_page,
-                    "Origin": "https://%s" % self.hostname,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                }).text or ""
-            except Exception as exc:  # noqa: BLE001
-                self.login_logger.error("登录请求异常（第 %d 轮）: %r" % (round_no, exc))
-                time.sleep(2)
-                continue
-
-            if "succeed" in resp_text:
-                self.logged_in = True
-                self.login_logger.info(
-                    "登录成功（第 %d 轮，密码形态=%s）"
-                    % (round_no, "md5" if round_no != 2 else "明文"))
-                if self.refresh_formhash():
-                    self.login_logger.info("已获取全局 formhash")
-                else:
-                    self.login_logger.warning("未能获取全局 formhash，后续写操作可能失败")
-                return True
-
-            snippet = re.sub(r"<[^>]+>", "", resp_text).strip()[:120]
-            self.login_logger.warning("第 %d 轮登录未成功: %s" % (round_no, snippet or "(空响应)"))
-
-            # 只有"验证码"类错误才值得换一张验证码重来
-            if "验证码" not in resp_text and "seccode" not in resp_text.lower():
-                # 非验证码错误：如果这轮用的是明文密码，说明密码形态也错了，继续换形态再试一次
-                if round_no == 2:
-                    self.login_logger.error(
-                        "非验证码原因失败，请检查账号密码 / 安全提问配置")
-                    break
-                self.login_logger.info("换一种密码提交形态再试一轮")
-                continue
-            time.sleep(1)
-
-        self.login_logger.error("登录失败，请检查凭证或安全提问设置")
-        return False
-
-    # ---------------------------------------------------------- 每日签到
-
-    def sign_gamemale(self):
-        self.sign_logger.info("执行每日签到...")
-        if not self.post_formhash:
-            self.sign_result = "失败：缺少 formhash"
-            self.sign_logger.error(self.sign_result)
-            return
-        url = self._url("/k_misign-sign.html?operation=qiandao&format=button&formhash=%s"
-                        % self.post_formhash)
-        try:
-            res = self.sess.get(url).text or ""
-            if "签到成功" in res:
-                self.sign_result = "签到成功"
-            elif "已签" in res:
-                self.sign_result = "今日已签到"
-            elif is_gated(res):
-                self.sign_result = "失败：被验证门拦截"
-            else:
-                self.sign_result = "未知响应状态"
-            self.sign_logger.info("签到结果: %s" % self.sign_result)
-        except Exception as exc:  # noqa: BLE001
-            self.sign_result = "异常: %r" % exc
-            self.sign_logger.error("签到异常: %r" % exc)
-
-    # ---------------------------------------------------------- 抽奖
-
-    def daily_exchange(self):
-        self.exchange_logger.info("执行日常卡片抽奖...")
-        if not self.post_formhash:
-            self.exchange_result = "失败：缺少 formhash"
-            return
-        url = self._url("/plugin.php?id=it618_award:ajax&ac=getaward&formhash=%s&_=%d"
-                        % (self.post_formhash, int(time.time() * 1000)))
-        headers = {
-            "accept": "application/json, text/javascript, */*; q=0.01",
-            "referer": self._url("/it618_award-award.html"),
-            "x-requested-with": "XMLHttpRequest",
-        }
-        try:
-            resp = self.sess.get(url, headers=headers)
-            if is_gated(resp.text or ""):
-                self.exchange_result = "失败：被验证门拦截"
-                return
-            data = resp.json()
-            tipname = data.get("tipname")
-            if tipname == "":
-                self.exchange_result = "无奖励（今日或已抽奖）"
-            elif tipname == "ok":
-                self.exchange_result = "抽奖成功: %s" % data.get("tipvalue")
-            else:
-                self.exchange_result = "非预期响应: %s" % tipname
-            self.exchange_logger.info("抽奖结果: %s" % self.exchange_result)
-        except Exception as exc:  # noqa: BLE001
-            self.exchange_result = "异常: %r" % exc
-            self.exchange_logger.error("抽奖异常: %r" % exc)
-
-    # ---------------------------------------------------------- 互动
-
-    def visit_spaces(self):
-        count = 0
-        for uid in self.uids:
-            try:
-                self.sess.get(self._url("/space-uid-%s.html" % uid))
-                count += 1
-                time.sleep(1)
-            except Exception as exc:  # noqa: BLE001
-                self.task_logger.warning("访问空间 %s 失败: %r" % (uid, exc))
-        return count
-
-    def poke_users(self):
-        count = 0
-        for uid in self.uids:
-            url = self._url("/home.php?mod=spacecp&ac=poke&op=send&uid=%s&inajax=1" % uid)
-            data = {"formhash": self.post_formhash, "poke": "1",
-                    "iconid": "3", "pokesubmit": "true"}
-            try:
-                if "succeed" in (self.sess.post(url, data=data,
-                                                headers={"Referer": self._url("/")}).text or ""):
-                    count += 1
-                time.sleep(1)
-            except Exception as exc:  # noqa: BLE001
-                self.task_logger.warning("打招呼 %s 失败: %r" % (uid, exc))
-        return count
-
-    def stance_blogs(self, target=10, max_pages=3):
-        count = 0
-        page = 1
-        while count < target and page <= max_pages:
-            list_url = self._url("/home.php?mod=space&do=blog&view=all&catid=14&page=%d" % page)
-            try:
-                res = self.sess.get(list_url).text or ""
-                if is_gated(res):
-                    self.task_logger.warning("日志列表被验证门拦截，跳过表态")
-                    break
-                blog_urls = set(re.findall(
-                    r"home\.php\?mod=space(?:&amp;|&)uid=\d+(?:&amp;|&)do=blog(?:&amp;|&)id=\d+",
-                    res))
-                if not blog_urls:
-                    self.task_logger.debug("第 %d 页没有解析到日志链接" % page)
-                for uri in blog_urls:
-                    if count >= target:
-                        break
-                    try:
-                        blog_res = self.sess.get(
-                            self._url("/" + uri.replace("&amp;", "&"))).text or ""
-                        click_match = re.search(
-                            r"(home\.php\?mod=spacecp(?:&amp;|&)ac=click(?:&amp;|&)op=add[^\"']+)",
-                            blog_res)
-                        if not click_match:
-                            continue
-                        click_url = self._url("/" + click_match.group(1).replace("&amp;", "&"))
-                        if "成功" in (self.sess.get(click_url, headers={
-                                "x-requested-with": "XMLHttpRequest"}).text or ""):
-                            count += 1
-                        time.sleep(1)
-                    except Exception as exc:  # noqa: BLE001
-                        self.task_logger.warning("日志表态失败: %r" % exc)
-            except Exception as exc:  # noqa: BLE001
-                self.task_logger.warning("日志列表第 %d 页异常: %r" % (page, exc))
-                break
-            page += 1
-        return count
-
-    def draw_and_guess(self):
-        url = self._url("/plugin.php?id=viewui_draw&mod=api&ac=adddraw")
-        base64_img = ("data:image/png;base64,"
-                      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADklEQVR4AWL6////fwAAAAD"
-                      "//w7I1cwAAAAGSURBVAMACgUD/9k79a8AAAAASUVORK5CYII=")
-        data = {"title": "水果", "answer": "苹果",
-                "pic": base64_img, "formhash": self.post_formhash}
-        headers = {
-            "x-requested-with": "XMLHttpRequest",
-            "origin": "https://%s" % self.hostname,
-            "referer": self._url("/plugin.php?id=viewui_draw"),
-        }
-        try:
-            resp = self.sess.post(url, data=data, headers=headers)
-            if is_gated(resp.text or ""):
-                return "失败：被验证门拦截"
-            try:
-                msg = resp.json().get("message", (resp.text or "")[:20])
-            except Exception:  # noqa: BLE001
-                msg = (resp.text or "")[:20]
-            self.task_logger.debug("你画我猜返回: %s" % msg)
-            if "成功" in msg or "succeed" in msg:
-                return "出题成功"
-            if "今日" in msg or "上限" in msg or "用完" in msg:
-                return "额度已满"
-            return "失败: %s" % str(msg)[:30]
-        except Exception as exc:  # noqa: BLE001
-            return "提交异常: %r" % exc
-
-    def execute_interactive_tasks(self):
-        self.task_logger.info("开始执行互动作业...")
-        s_count = self.visit_spaces()
-        p_count = self.poke_users()
-        b_count = self.stance_blogs(target=10, max_pages=3)
-        d_status = self.draw_and_guess()
-        self.task_result = ("空间访问(%d/3) | 打招呼(%d/3) | 日志表态(%d/10) | 你画我猜(%s)"
-                            % (s_count, p_count, b_count, d_status))
-        self.task_logger.info("互动作业结果: %s" % self.task_result)
-
-    # ---------------------------------------------------------- 资产
-
-    @staticmethod
-    def _extract_assets(clean_text):
-        """
-        从去标签后的文本里抓 8 项资产。
-        原版对全文无锚点直接匹配，"金币"二字出现在任何位置都可能被误抓；
-        这里保留"名称 + 可选分隔符 + 数字"的匹配，同时记录命中上下文便于排障，
-        并允许未命中的项返回 None（而不是静默记 0）。
-        """
-        assets = {}
-        contexts = {}
-        for item in ASSET_ITEMS:
-            m = re.search(r"%s\s*[:：=]?\s*(\d{1,9})" % re.escape(item), clean_text)
-            if m:
-                assets[item] = int(m.group(1))
-                start = max(0, m.start() - 20)
-                contexts[item] = re.sub(r"\s+", " ", clean_text[start:m.end() + 10])
-            else:
-                assets[item] = None
-        return assets, contexts
-
-    def fetch_assets(self):
-        self.task_logger.info("正在获取个人资产数据...")
-        url = self._url("/home.php?mod=spacecp&ac=credit&op=base")
-        try:
-            res = self.sess.get(url).text or ""
-            if is_gated(res):
-                self.assets_report = "资产抓取失败：被验证门拦截"
-                self.task_logger.error(self.assets_report)
-                return
-
-            clean_text = re.sub(r"<script.*?</script>", " ", res, flags=re.S | re.I)
-            clean_text = re.sub(r"<style.*?</style>", " ", clean_text, flags=re.S | re.I)
-            clean_text = re.sub(r"<[^>]+>", " ", clean_text)
-            clean_text = re.sub(r"&nbsp;?", " ", clean_text)
-            clean_text = re.sub(r"[ \t\u3000]+", " ", clean_text)
-
-            if os.getenv("GM_DEBUG_ASSETS", "").strip() in ("1", "true", "yes"):
-                try:
-                    with open("assets_debug.txt", "w", encoding="utf-8") as fh:
-                        fh.write(clean_text)
-                    self.task_logger.info("已导出 assets_debug.txt 供人工核对")
-                except Exception as exc:  # noqa: BLE001
-                    self.task_logger.warning("导出 assets_debug.txt 失败: %r" % exc)
-
-            assets, contexts = self._extract_assets(clean_text)
-            for item in ASSET_ITEMS:
-                if contexts.get(item):
-                    self.task_logger.debug("资产命中 %s -> %s" % (item, contexts[item]))
-
-            if assets.get("金币") is None:
-                self.assets_ok = False
-                self.assets_report = ("资产抓取失败：未能解析到金币数量"
-                                      "（页面 %d 字节，可能未登录或页面结构变化）" % len(res))
-                self.task_logger.error(self.assets_report)
-                return
-
-            current_gold = assets["金币"]
-            last_gold = current_gold
-            if os.path.exists("gold_record.txt"):
-                try:
-                    with open("gold_record.txt", "r", encoding="utf-8") as fh:
-                        content = fh.read().strip()
-                    if content.isdigit():
-                        last_gold = int(content)
-                except Exception as exc:  # noqa: BLE001
-                    self.task_logger.warning("读取 gold_record.txt 失败: %r" % exc)
-
-            growth = current_gold - last_gold
-            growth_str = "+%d" % growth if growth >= 0 else str(growth)
-
-            # 仅在解析成功时回写基准，避免把 0 或错值写进去污染后续对比
-            try:
-                with open("gold_record.txt", "w", encoding="utf-8") as fh:
-                    fh.write(str(current_gold))
-            except Exception as exc:  # noqa: BLE001
-                self.task_logger.warning("写入 gold_record.txt 失败: %r" % exc)
-
-            def v(k):
-                return assets[k] if assets[k] is not None else "?"
-
-            self.assets_report = (
-                "金币: %s (较上次 %s)\n"
-                "血液: %s | 旅程: %s | 追随: %s\n"
-                "知识: %s | 咒术: %s | 堕落: %s\n"
-                "灵魂: %s"
-                % (current_gold, growth_str, v("血液"), v("旅程"), v("追随"),
-                   v("知识"), v("咒术"), v("堕落"), v("灵魂"))
-            )
-            self.assets_ok = True
-        except Exception as exc:  # noqa: BLE001
-            self.assets_report = "资产抓取异常: %r" % exc
-            self.task_logger.error(self.assets_report)
-        self.task_logger.info("当前账户综合看板:\n%s" % self.assets_report)
-
-    # ---------------------------------------------------------- 邮件
-
-    def send_notification(self):
-        smtp_host = env("GM_SMTP_HOST", "SMTP_HOST")
-        mail_user = env("GM_MAIL_USER", "MAIL_USER")
-        mail_pass = env("GM_MAIL_PASS", "MAIL_PASS")
-        mail_to = env("GM_MAIL_TO", "MAIL_TO") or mail_user
-
-        if not all([smtp_host, mail_user, mail_pass]):
-            self.notice_logger.warning("未配置完整的 SMTP_HOST / MAIL_USER / MAIL_PASS，跳过邮件通知")
-            return False
-
-        status = "成功" if (self.logged_in and not self.fatal_error) else "异常"
-        self.notice_logger.info("发送推送邮件至 %s ..." % mail_to)
-
-        fail_block = ""
-        if self.fatal_error:
-            fail_block = ("<p style='color:#c00;'><b>中断原因:</b> %s</p>"
-                          % self.fatal_error.replace("<", "&lt;"))
-
-        mail_content = (
-            "<h3>GameMale 每日自动化任务报告</h3>"
-            "<p><b>运行模式:</b> %s | <b>验证门:</b> %s | <b>总体:</b> %s</p>"
-            "%s"
-            "<p><b>登录:</b> %s</p>"
-            "<p><b>核心签到:</b> %s</p>"
-            "<p><b>日常抽奖:</b> %s</p>"
-            "<p><b>互动作业:</b> %s</p>"
-            "<br><h4>当前核心资产状态：</h4>"
-            "<pre style='background:#f4f4f4;padding:15px;border-radius:5px;"
-            "font-family:monospace;line-height:1.6;font-size:14px;'>%s</pre>"
-            "<br><small style='color:#888;'>报告由 GM-All-In-One（修复版）生成</small>"
-            % (self.run_mode, self.gate_mode, status, fail_block,
-               "成功" if self.logged_in else "失败",
-               self.sign_result, self.exchange_result, self.task_result,
-               self.assets_report.replace("<", "&lt;"))
-        )
-
-        message = MIMEText(mail_content, "html", "utf-8")
-        message["From"] = formataddr((Header("GM-Bot", "utf-8").encode(), mail_user))
-        message["To"] = formataddr((Header("Master", "utf-8").encode(), mail_to))
-        message["Subject"] = Header(
-            "GameMale 任务运行报告 - %s [%s]" % (status, self.sign_result), "utf-8")
-        try:
-            server = smtplib.SMTP_SSL(smtp_host, 465, timeout=30)
-            server.login(mail_user, mail_pass)
-            server.sendmail(mail_user, [mail_to], message.as_string())
-            server.quit()
-            self.notice_logger.info("推送邮件发送成功")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            self.notice_logger.error("推送邮件发送失败: %r" % exc)
-            return False
-
-    # ---------------------------------------------------------- 主流程
-
-    def run(self, send_mail=True):
-        self.main_logger.info("=== GM-All-In-One 任务引擎启动（模式: %s）===" % self.run_mode)
-        ok = True
-        try:
-            if not self.connect():
-                ok = False
-            elif not self.logged_in and not self.login():
-                self.fatal_error = self.fatal_error or "登录失败"
-                ok = False
-            else:
-                if self.logged_in and self.gate_mode == USER_COOKIE_MODE:
-                    self.main_logger.info(
-                        "用户 Cookie 模式：已带登录态，跳过登录流程"
-                        "（因此不会触碰被 403 封死的 %s）"
-                        % ", ".join(SPIDER_BLOCKED_PATHS))
-                if self.run_mode in ("light", "check"):
-                    self.main_logger.info("%s 模式：跳过签到/抽奖/互动，仅抓取资产" % self.run_mode)
-                else:
-                    self.sign_gamemale()
-                    self.daily_exchange()
-                    self.execute_interactive_tasks()
-                self.fetch_assets()
-                if not self.assets_ok:
-                    ok = False
-        except Exception as exc:  # noqa: BLE001
-            self.fatal_error = "未捕获异常: %r" % exc
-            self.main_logger.error(self.fatal_error)
-            ok = False
-        finally:
-            if send_mail:
-                self.send_notification()
-            self.gate.close()
-        self.main_logger.info("=== 任务结束（%s）===" % ("成功" if ok else "存在失败项"))
-        return ok
-
-
-# =============================================================== 入口
-
-
 def main():
-    parser = argparse.ArgumentParser(description="GameMale 论坛自动签到（修复版）")
-    parser.add_argument("--check", action="store_true",
-                        help="自检模式：破门 + 登录 + 抓资产，不发邮件、不做写操作")
-    parser.add_argument("--verbose", action="store_true", help="输出调试日志")
-    parser.add_argument("--no-mail", action="store_true", help="本次不发邮件")
+    parser = argparse.ArgumentParser(description="GameMale 验证门诊断工具")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--solve", action="store_true", help="实际尝试浏览器破门")
+    parser.add_argument("--headed", action="store_true", help="用有头浏览器（推荐）")
+    parser.add_argument("--headless", action="store_true", help="强制无头浏览器（基本过不了）")
+    parser.add_argument("--manual", action="store_true", help="人工模式：手动点验证（本地救急）")
+    parser.add_argument("--export", action="store_true", help="破门后导出 Cookie 串")
+    parser.add_argument("--probe-login", action="store_true",
+                        help="破门后验证登录页 + 验证码图片是否可达")
+    parser.add_argument("--capsolver", default=None, help="直接用 CapSolver key 破门")
+    parser.add_argument("--chrome", default=None, help="Chrome 可执行文件路径")
+    parser.add_argument("--verify-cookie", action="store_true",
+                        help="只检查 GM_USER_COOKIE 是否有效（配 Secret 前后各跑一次）")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="不做浏览器破门（CI 上省时间，直接判定失败）")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    username = env("GM_USERNAME", "GM_USER", "USERNAME")
-    password = env("GM_PASSWORD", "GM_PASS", "PASSWORD")
+    logger = _build_logger(args.verbose)
+    http = HttpEngine(args.host, logger)
+    logger.info("HTTP 引擎: %s" % http.kind)
 
-    if not username or not password:
-        print("缺少账号配置：请设置 GM_USERNAME / GM_PASSWORD"
-              "（Windows 上 USERNAME 是系统内置变量，本地请用 GM_USERNAME）")
+    gate = GateKeeper(args.host, logger, browser_path=args.chrome,
+                      manual=args.manual, export_cookie=args.export)
+    if args.headless:
+        gate.headless = True
+    if args.headed:
+        gate.headless = False
+
+    # 无论干什么都先把 Cookie 的「长度 + 指纹」打出来。
+    # 这一行是整个排查体系的锚点：CI 里拿它和本地生成时打印的指纹对一下，
+    # 立刻能分辨「Secret 没生效（空/名字错/放进了 Variables）」还是「真的过期了」。
+    raw_cookie = os.getenv(USER_COOKIE_ENV)
+    parsed_cookie = parse_cookie_header(raw_cookie)
+    print("[Cookie] %s: 长度=%d 指纹=%s 解析出 %d 项"
+          % (USER_COOKIE_ENV, len((raw_cookie or "").strip()),
+             cookie_fingerprint(raw_cookie), len(parsed_cookie)))
+    if not (raw_cookie or "").strip():
+        print("         → 未生效：Secret 名写错 / 加到了 Variables 而非 Secrets / 该步骤没注入 env")
+
+    # --verify-cookie：只验 Cookie，不做别的。用来在本地确认「这串能不能用」，
+    # 以及确认 CI 里 Secret 是不是真的注入了（对指纹即可）。
+    if args.verify_cookie:
+        if not raw_cookie or not raw_cookie.strip():
+            print("  → 环境变量为空：Secret 名写错 / 没配 / 该步骤没注入 env")
+            return 1
+        if not parsed_cookie:
+            print("  → 解析不出任何 Cookie：粘贴内容被截断了")
+            return 1
+        print("  → Cookie 名: %s" % ", ".join(sorted(parsed_cookie)))
+        ok = gate.try_user_cookie(http)
+        gate.close()
+        if ok:
+            print("  → 结果：有效，已登录 uid=%s" % gate.logged_uid)
+            return 0
+        print("  → 结果：无效（状态=%s），请看上面那条 error/warning" % gate.user_cookie_state)
         return 1
 
-    gm = Gamemale(
-        username=username,
-        password=password,
-        questionid=env("GM_QUESTIONID", default="0"),
-        answer=env("GM_ANSWER", default=""),
-        verbose=args.verbose,
-        hostname=env("GM_HOST", default=DEFAULT_HOST),
-        run_mode=env("GM_RUN_MODE", default="check" if args.check else "full"),
-        uids=parse_uids(env("GM_UIDS")),
-        chrome_path=env("GM_CHROME_PATH"),
-    )
-    if args.check:
-        gm.run_mode = "check"
-        gm.main_logger.info("自检模式：破门 → 登录 → 抓资产，不发邮件、不执行写操作")
-        ok = gm.run(send_mail=False)
+    how = None
+
+    # 顺序与 ensure_access() 完全一致：用户 Cookie -> 过门 Cookie -> 现场破门
+    # 路线 A：用户自己的登录 Cookie（命中就完全不必碰 Turnstile）
+    if gate.try_user_cookie(http):
+        print("\n[门口状态] 路线A 用户 Cookie —— 已是登录态（uid=%s），跳过 Turnstile 与验证码"
+              % gate.logged_uid)
+        how = "用户 Cookie（%s）" % USER_COOKIE_ENV
+    elif gate.user_cookie_state in ("broken", "expired", "gated"):
+        print("\n[门口状态] 路线A 失败：%s 已配置但不可用（状态=%s）"
+              % (USER_COOKIE_ENV, gate.user_cookie_state))
+    elif gate.try_preset_cookie(http):
+        print("\n[门口状态] 路线A' 过门 Cookie 有效（%s）" % COOKIE_ENV)
+        how = "预置 Cookie（%s）" % COOKIE_ENV
+
+    if how:
+        state = OPEN
     else:
-        ok = gm.run(send_mail=not args.no_mail)
-    return 0 if ok else 1
+        state = gate.classify(http)
+        print("\n[门口状态] %s" % state)
+
+    if how:
+        pass
+    elif args.capsolver:
+        try:
+            ok = gate.solve_with_capsolver(http, args.capsolver)
+            how = "CapSolver" if ok else None
+            print("[CapSolver 破门] %s" % ("成功" if ok else "失败"))
+        except GateError as exc:
+            print("[CapSolver 破门失败] %s" % exc)
+    elif args.solve:
+        try:
+            ok = gate.solve_with_browser(http)
+            how = "浏览器" if ok else None
+            print("[浏览器破门] %s" % ("成功" if ok else "失败"))
+        except GateError as exc:
+            print("[浏览器破门失败] %s" % exc)
+    elif args.no_browser:
+        print("[跳过] --no-browser：不做浏览器破门")
+    else:
+        print("[提示] 未指定 --solve / --capsolver，只做探测。"
+              "若已配置 %s / %s 会自动复用。"
+              % (USER_COOKIE_ENV, COOKIE_ENV))
+
+    if how:
+        print("[过门方式] %s" % how)
+
+    # 无论走哪条路，最后都复核一次
+    try:
+        r = http.get(gate.forum_url)
+        print("[复验] HTTP %s / %d 字节 / 像论坛页=%s"
+              % (r.status_code, len(r.text or ""), looks_like_forum(r.text or "")))
+    except Exception as exc:  # noqa: BLE001
+        print("[复验] 异常 %r" % exc)
+
+    if args.probe_login:
+        info = gate.probe_login(http)
+        print("\n[登录链路自检]")
+        print("  登录页可达      : %s" % info["login_page"])
+        print("  解析到 idhash   : %s" % info["idhash"])
+        print("  验证码图片可取  : %s（%d 字节）" % (info["seccode_image"], info["image_bytes"]))
+        print("  OCR 结果        : %s" % info["ocr"])
+        if info["note"]:
+            print("  备注            : %s" % info["note"])
+
+    gate.close()
+
+    # 退出码有意义，CI 里才能靠它判断（别再出现「失败了但 job 是绿的」）
+    if how:
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
