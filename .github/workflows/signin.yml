@@ -106,7 +106,7 @@ jobs:
         run: |
           set -o pipefail
           if [ -z "$GM_USER_COOKIE" ]; then
-            echo "::warning title=建议配置 GM_USER_COOKIE::未配置 GM_USER_COOKIE，将回退到浏览器破门。实测 GitHub Runner 的机房 IP 会被 Turnstile 降级，这道门在 CI 上几乎不可能自动通过。请本地执行 python get_user_cookie.py，把打印出的那一整行存成 Secret GM_USER_COOKIE。"
+            echo "::warning title=建议配置 GM_USER_COOKIE::未配置，将回退到浏览器破门。这条路实测在 CI 上「能成功但不稳定」：有轮次 idle->interaction_required->点击->通过，也有轮次连续卡住。要确定性请跑 python get_user_cookie.py，把整行存成 Secret GM_USER_COOKIE。"
             exit 0
           fi
           if ! python gm_gate.py --verify-cookie 2>&1 | tee verify_cookie.txt; then
@@ -133,9 +133,10 @@ jobs:
           CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
           # 【路线 C 的加速缓存】本地破门一次导出的放行 Cookie（寿命很短，仅作可选优化）
           GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
-          # 浏览器兜底的成本必须压住：上游默认 3 次 × 90 秒 ≈ 5 分钟，
-          # 而它在 CI 上基本不可能成功（机房 IP 被 Turnstile 降级）。
-          # 1 次 × 75 秒，失败就快速给出可读的结论，而不是干等 5 分钟。
+          # 浏览器兜底的成本必须压住：上游默认 3 次 × 90 秒 ≈ 5 分钟。
+          # 实测它「能过但不稳」（2026-09-23 有过一次 idle->interaction_required->点击->通过的完整成功），
+          # 所以保留 1 次机会；1 次 × 75 秒足够走完「加载 -> 点击 -> 通过」，
+          # 失败也能快速给出可读结论，而不是干等 5 分钟。
           GM_BROWSER_ATTEMPTS: '1'
           GM_SOLVE_TIMEOUT: '75'
         run: |
@@ -162,7 +163,10 @@ jobs:
 
       - name: Upload Debug Artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        # 注意：必须 v6 起步，v5 的默认运行时**仍然是 Node 20**
+        # （v5 只是「预备支持」，v6.0.0 才把 runs.using 改成 node24，v7 在其上加了直传单文件）。
+        # Runner 已强制用 Node 24 跑声明 node20 的 action，功能正常但会刷弃用警告。
+        uses: actions/upload-artifact@v7
         with:
           name: gm-debug-${{ github.run_number }}
           # 注意：绝对不要加 user_cookie.txt —— 那是登录凭据，上传 Artifact 等于泄露。
