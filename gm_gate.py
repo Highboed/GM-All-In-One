@@ -93,6 +93,7 @@ Cloudflare 一眼识破，于是永远给出交互挑战，而且点击永远不
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -162,6 +163,18 @@ class GateError(Exception):
     """过门失败。"""
 
 
+def _env_int(name, default, low, high):
+    """读一个整数型环境变量，非法值一律回落到默认值（绝不因此炸掉流程）。"""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return max(low, min(high, val))
+
+
 # ---------------------------------------------------------------- Cookie 复用编解码
 
 
@@ -188,30 +201,71 @@ def decode_cookie_blob(blob):
     return CHROME_UA, data
 
 
+def cookie_fingerprint(raw):
+    """
+    算一个短的「指纹」，用来确认 CI 里拿到的 Secret 和你本地生成的那串**完全一致**。
+
+    这个功能是必需的：GitHub Secret 配错名字 / 粘漏了字符 / 带上了多余换行时，
+    脚本表现和「没配」几乎一样，日志里根本看不出来。有了指纹就能一句话对上。
+    """
+    txt = (raw or "").strip()
+    if not txt:
+        return "(空)"
+    return hashlib.sha256(txt.encode("utf-8")).hexdigest()[:12]
+
+
 def parse_cookie_header(raw):
     """
     把浏览器里复制出来的 `Cookie:` 头解析成字典。
 
-    兼容几种常见粘贴形态：
-        a=1; b=2
-        Cookie: a=1; b=2
-        a=1;\nb=2
-    值里含 '=' 也能正确切分（只在第一个 '=' 处切）。
+    兼容几种常见粘贴形态（都是实测遇到过的）：
+        a=1; b=2                  ← DevTools > Network > Cookie 头，最标准
+        Cookie: a=1; b=2          ← 连 "Cookie:" 一起复制了
+        a=1;\nb=2                 ← 多行
+        {"a": "1", "b": "2"}      ← 从别处导出的 JSON
+        "a=1; b=2"                ← 带引号
+    值里含 '='（如 base64 的 auth）也能正确切分：只在**第一个** '=' 处切。
     """
     if not raw:
         return {}
     txt = raw.strip()
-    if txt.lower().startswith("cookie:"):
+
+    # 形态：整段 JSON
+    if txt.startswith("{"):
+        try:
+            data = json.loads(txt)
+            if isinstance(data, dict):
+                flat = {}
+                for k, v in data.items():
+                    if isinstance(k, str):
+                        flat[k] = "" if v is None else str(v)
+                if flat:
+                    return flat
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 去掉包裹引号
+    if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in ("'", '"'):
+        txt = txt[1:-1]
+
+    # 形态：带 "Cookie:" 前缀
+    low = txt.lower()
+    if low.startswith("cookie:"):
         txt = txt.split(":", 1)[1]
     txt = txt.replace("\r", " ").replace("\n", " ")
+    # 有人会把 curl 的 -H 内容整段粘进来，这里顺手剥掉常见的包裹
+    txt = txt.strip().strip("'\"")
+    if txt.lower().startswith("cookie:"):
+        txt = txt.split(":", 1)[1]
+
     out = {}
     for part in txt.split(";"):
         part = part.strip()
         if not part or "=" not in part:
             continue
         name, _, value = part.partition("=")
-        name = name.strip()
-        if name:
+        name = name.strip().strip("'\"")
+        if name and " " not in name:      # cookie 名里不可能有空格，有就是粘错了
             out[name] = value.strip()
     return out
 
@@ -388,8 +442,10 @@ class GateKeeper:
                  manual=False, export_cookie=False):
         self.hostname = hostname
         self.logger = logger
-        self.solve_timeout = solve_timeout
-        self.browser_attempts = browser_attempts
+        # 浏览器兜底的开销在 CI 上要压住：一轮 90 秒 × 3 次 ≈ 5 分钟纯浪费。
+        # 两者都可以用环境变量覆盖，调完不用改代码。
+        self.solve_timeout = _env_int("GM_SOLVE_TIMEOUT", solve_timeout, 20, 600)
+        self.browser_attempts = _env_int("GM_BROWSER_ATTEMPTS", browser_attempts, 1, 5)
         self.manual = manual
         self.export_cookie = export_cookie
         self.browser_path = browser_path or os.getenv("GM_CHROME_PATH") or self.find_chrome()
@@ -403,6 +459,9 @@ class GateKeeper:
         self.gate_cookie_blob = None    # 过门后导出的 Cookie 串
         self.gate_mode = None           # 最终采用的过门方式（user_cookie / browser / ...）
         self.logged_uid = None          # 用户 Cookie 模式下的已登录 uid
+        # GM_USER_COOKIE 的状态：absent / broken / expired / gated / ok
+        # 区分「没配」「配了但解析不出」「配了但已失效」，才能给出对的提示。
+        self.user_cookie_state = None
 
     def url(self, path):
         """拼绝对地址。path 需以 / 开头。"""
@@ -627,11 +686,62 @@ class GateKeeper:
     _TOKEN_JS = ("var i=document.querySelector('input[name=\"cf-turnstile-response\"]');"
                  "return i ? (i.value || '') : '';")
 
+    # 定位 Turnstile widget。返回 JSON 里带 what / iframes 是为了诊断：
+    # 之前 CI 日志里从来没有出现过「已点击复选框」，说明这里一直返回空，
+    # 但当时没有任何信息能看出是「没有 iframe」还是「选择器写错了」。
     _GBOX_JS = """
-var f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-if (!f) return '';
-var r = f.getBoundingClientRect();
-return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
+var out = {what:'', x:0, y:0, w:0, h:0, iframes:[]};
+try {
+  var all = document.querySelectorAll('iframe');
+  for (var i=0;i<all.length;i++){ out.iframes.push((all[i].src||'(no-src)').slice(0,110)); }
+  var el = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+  if (el) out.what = 'iframe';
+  if (!el) {
+    var host = document.getElementById('turnstile')
+            || document.querySelector('.cf-turnstile')
+            || document.querySelector('div[data-sitekey]');
+    if (host) {
+      var sr = host.shadowRoot;
+      if (sr) {
+        var f2 = sr.querySelector('iframe');
+        if (f2) { el = f2; out.what = 'shadow-iframe'; }
+      }
+      if (!el) { el = host; out.what = 'container'; }
+    }
+  }
+  if (el) {
+    var r = el.getBoundingClientRect();
+    out.x = r.x; out.y = r.y; out.w = r.width; out.h = r.height;
+    if (out.w < 1 || out.h < 1) { out.what = out.what + '(zero-size)'; }
+  }
+} catch (e) { out.what = 'error:' + e; }
+return JSON.stringify(out);
+"""
+
+    # 破门失败时落盘的诊断快照。CI 里能通过 Artifact 下载下来直接看。
+    _DIAG_JS = """
+var out = {url: location.href, ready: document.readyState, iframes: [], token: '', msg: ''};
+try {
+  var m = document.getElementById('check_msg');
+  out.msg = m ? m.innerText.replace(/\\s+/g,' ').trim() : '(无 check_msg)';
+  var t = document.querySelector('input[name="cf-turnstile-response"]');
+  out.token = t ? String((t.value||'').length) : '(无 token 输入框)';
+  var all = document.querySelectorAll('iframe');
+  for (var i=0;i<all.length;i++){
+    var r = all[i].getBoundingClientRect();
+    out.iframes.push({src:(all[i].src||'').slice(0,110),
+                      x:Math.round(r.x), y:Math.round(r.y),
+                      w:Math.round(r.width), h:Math.round(r.height)});
+  }
+  var host = document.getElementById('turnstile') || document.querySelector('.cf-turnstile');
+  if (host) {
+    var hr = host.getBoundingClientRect();
+    out.host = {x:Math.round(hr.x), y:Math.round(hr.y),
+                w:Math.round(hr.width), h:Math.round(hr.height),
+                shadow: host.shadowRoot ? 'yes' : 'no'};
+  } else { out.host = null; }
+} catch (e) { out.err = String(e); }
+return JSON.stringify(out);
 """
 
     def _check_msg(self, page):
@@ -698,43 +808,98 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
         page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
                      x=int(x), y=int(y), button="left", buttons=0, clickCount=1)
 
+    def _dump_gate_debug(self, page, note=""):
+        """把门页面的关键状态落盘成 gate_debug.txt，CI 里能当 Artifact 下载下来看。"""
+        try:
+            raw = page.run_js(self._DIAG_JS)
+        except Exception as exc:  # noqa: BLE001
+            raw = "run_js 失败: %r" % exc
+        try:
+            with open(os.path.join(os.getcwd(), "gate_debug.txt"), "a",
+                      encoding="utf-8") as fh:
+                fh.write("[%s] %s\n%s\n\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                              note, raw))
+        except Exception:  # noqa: BLE001
+            pass
+        return raw
+
     def _try_click_turnstile(self, page):
-        """Turnstile 要交互时，复选框在跨域 iframe 内。多策略尝试，全部失败也不报错。"""
+        """
+        触发 Turnstile 的复选框。
+
+        复选框本体在 **跨域 iframe**（challenges.cloudflare.com）里，坐标点击是唯一
+        能碰到它的手段；DrissionPage 的元素点击对跨域 iframe 通常无效，所以放在后面兜。
+        三种策略都会打 INFO 日志 —— 之前这里全是 debug，导致 CI 日志里看不出
+        「到底有没有在点」，白排查了很久。
+        """
         raw = None
         try:
             raw = page.run_js(self._GBOX_JS)
         except Exception as exc:  # noqa: BLE001
-            self._log("debug", "读取 turnstile iframe 位置失败: %r" % exc)
+            self._log("warning", "读取 Turnstile widget 位置失败: %r" % exc)
+
         box = None
         if raw:
             try:
                 box = json.loads(raw) if isinstance(raw, str) else raw
             except Exception:  # noqa: BLE001
                 box = None
+
         if not box or not box.get("w"):
-            self._log("debug", "未定位到 Turnstile iframe（raw=%r）" % (raw,))
+            diag = self._dump_gate_debug(page, "定位 Turnstile 失败")
+            self._log("warning",
+                      "未能定位 Turnstile widget（what=%s, iframes=%s）"
+                      % ((box or {}).get("what", "?"), (box or {}).get("iframes", raw)))
+            self._log("warning", "诊断快照: %s" % (diag or "")[:300])
             return False
 
-        # 策略 1：CDP 真人轨迹点击 iframe 左侧复选框（Turnstile 复选框贴左边）
+        what = box.get("what", "iframe")
         cx, cy = box["x"] + 30, box["y"] + box["h"] / 2.0
+
+        # 策略 1：CDP 真人轨迹坐标点击（跨域 iframe 内唯一可靠的办法）
         try:
             self._human_click(page, cx, cy)
-            self._log("info", "已点击 Turnstile 复选框 (%.0f, %.0f)，iframe 位于 "
+            self._log("info", "已点击 Turnstile 复选框 (%d, %d) ｜ 匹配=%s ｜ 位置 "
                               "(%.0f, %.0f) %.0fx%.0f"
-                      % (cx, cy, box["x"], box["y"], box["w"], box["h"]))
+                      % (cx, cy, what, box["x"], box["y"], box["w"], box["h"]))
             return True
         except Exception as exc:  # noqa: BLE001
-            self._log("debug", "坐标点击失败: %r" % exc)
+            self._log("warning", "坐标点击失败: %r" % exc)
 
-        # 策略 2：让 DrissionPage 直接点 iframe 元素
-        try:
-            el = page.ele('css:iframe[src*="challenges.cloudflare.com"]', timeout=2)
-            if el:
+        # 策略 2：DrissionPage 元素点击
+        for selector in ('css:iframe[src*="challenges.cloudflare.com"]',
+                         "css:#turnstile", "css:.cf-turnstile"):
+            try:
+                el = page.ele(selector, timeout=2)
+            except Exception:  # noqa: BLE001
+                el = None
+            if not el:
+                continue
+            try:
                 el.click()
-                self._log("info", "已通过元素点击 Turnstile 复选框")
+                self._log("info", "已通过元素点击 Turnstile（%s）" % selector)
                 return True
+            except Exception as exc:  # noqa: BLE001
+                self._log("warning", "元素点击失败（%s）: %r" % (selector, exc))
+
+        # 策略 3：键盘激活（复选框可聚焦，空格能勾选）
+        try:
+            page.run_cdp("Input.dispatchMouseEvent", type="mousePressed",
+                         x=int(cx), y=int(cy), button="left", buttons=1, clickCount=1)
+            page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased",
+                         x=int(cx), y=int(cy), button="left", buttons=0, clickCount=1)
+            for key in ("Tab", " "):
+                page.run_cdp("Input.dispatchKeyEvent", type="keyDown", key=key,
+                             code="Space" if key == " " else key)
+                time.sleep(0.1)
+                page.run_cdp("Input.dispatchKeyEvent", type="keyUp", key=key,
+                             code="Space" if key == " " else key)
+                time.sleep(0.1)
+            self._log("info", "已尝试键盘激活 Turnstile 复选框")
+            return True
         except Exception as exc:  # noqa: BLE001
-            self._log("debug", "元素点击失败: %r" % exc)
+            self._log("warning", "键盘激活失败: %r" % exc)
+
         return False
 
     def _read_cookies(self, page):
@@ -888,6 +1053,9 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
                 token_tried = False
 
             time.sleep(1)
+
+        # 超时也要留下现场，否则 CI 里只能看到「失败」两个字
+        self._dump_gate_debug(page, "破门超时（%.0f 秒内未通过）" % timeout)
         return False
 
     def _merge_browser_cookies(self, page, http):
@@ -1079,13 +1247,27 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
         返回 True 表示可用。
         """
         raw = os.getenv(USER_COOKIE_ENV)
-        if not raw:
+        if not raw or not raw.strip():
+            self.user_cookie_state = "absent"
             return False
 
         cookies = parse_cookie_header(raw)
+        fp = cookie_fingerprint(raw)
         if not cookies:
-            self._log("warning", "%s 解析后是空的，请检查粘贴内容" % USER_COOKIE_ENV)
+            self.user_cookie_state = "broken"
+            self._log("error",
+                      "%s 解析后是空的（长度=%d，指纹=%s）。"
+                      "请确认粘贴的是形如 `name=value; name=value` 的一整行。"
+                      % (USER_COOKIE_ENV, len(raw.strip()), fp))
             return False
+
+        # 指纹必须能在本地与 CI 日志之间对上，否则就是 Secret 没生效 / 粘漏了
+        self._log("info", "%s: 长度=%d 指纹=%s 解析出 %d 项 Cookie"
+                  % (USER_COOKIE_ENV, len(raw.strip()), fp, len(cookies)))
+        if not any(k.endswith("_auth") or k.endswith("_saltkey") for k in cookies):
+            self._log("warning",
+                      "Cookie 里没有 `*_auth`（Discuz 登录凭据），"
+                      "多半只复制了部分 Cookie，登录态可能不被识别")
 
         ua = self.spider_ua()
         # 失败时必须把 UA 还原，否则会把「借来的蜘蛛 UA」留给后面的 classify，
@@ -1100,33 +1282,45 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
                   % (USER_COOKIE_ENV, len(cookies)))
         self._log("debug", "Cookie 名单: %s" % ", ".join(sorted(cookies)))
 
-        try:
-            resp = http.get(self.url("/home.php?mod=spacecp"))
-        except Exception as exc:  # noqa: BLE001
-            self._log("warning", "用户 Cookie 验证请求异常: %r" % exc)
+        uid = None
+        gated = False
+        # 多取一个页面交叉验证，避免「某个页面没印 discuz_uid」被误判成 Cookie 失效
+        for path in ("/home.php?mod=spacecp", "/forum.php"):
+            try:
+                resp = http.get(self.url(path))
+            except Exception as exc:  # noqa: BLE001
+                self._log("warning", "用户 Cookie 验证请求异常（%s）: %r" % (path, exc))
+                continue
+            body = resp.text or ""
+            if is_gated(body):
+                gated = True
+                continue
+            uid = detect_uid(body)
+            if uid:
+                break
+
+        if gated and not uid:
+            self.user_cookie_state = "gated"
+            self._log("warning",
+                      "用户 Cookie 模式下仍被拦门 —— 说明 GM_SPIDER_UA 这个 UA "
+                      "不在站点白名单里（请勿随意改它）")
             http.clear_cookies()
             http.set_user_agent(orig_ua)
             return False
 
-        body = resp.text or ""
-        if is_gated(body):
-            self._log("warning", "用户 Cookie 模式下仍被拦门（说明 GM_SPIDER_UA 不在白名单）")
-            http.clear_cookies()
-            http.set_user_agent(orig_ua)
-            return False
-
-        uid = detect_uid(body)
         if uid:
+            self.user_cookie_state = "ok"
             self._log("info", "用户 Cookie 有效，已登录 uid=%d —— 跳过浏览器与验证码" % uid)
             self.state = OPEN
             self.gate_mode = USER_COOKIE_MODE
             self.logged_uid = uid
             return True   # 成功时保留蜘蛛 UA（后续请求都要用它）
 
-        self._log("warning",
-                  "用户 Cookie 已失效（服务端认为未登录）。"
-                  "请重新在浏览器登录 %s 后复制新的 Cookie 串更新 %s"
-                  % (self.hostname, USER_COOKIE_ENV))
+        self.user_cookie_state = "expired"
+        self._log("error",
+                  "用户 Cookie 已失效（服务端认为未登录，指纹=%s）。"
+                  "请重新在浏览器登录 %s 后复制新的 Cookie 串，更新仓库 Secret %s"
+                  % (fp, self.hostname, USER_COOKIE_ENV))
         http.clear_cookies()
         http.set_user_agent(orig_ua)
         return False
@@ -1175,6 +1369,24 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
         if self.try_user_cookie(http):
             return USER_COOKIE_MODE
 
+        # 配了却不能用 —— 必须立刻停，否则会白烧几分钟去开浏览器，最后给一个看不懂的报错
+        if self.user_cookie_state in ("broken", "expired", "gated"):
+            reason = {
+                "broken": "内容解析不出任何 Cookie（多半是粘贴时截断了）",
+                "expired": "Cookie 已失效（服务端认为未登录，通常是超过约 30 天或改了密码）",
+                "gated": "带上它仍被拦门（GM_SPIDER_UA 被改动过？）",
+            }[self.user_cookie_state]
+            raise GateError(
+                "%s 已配置但不可用：%s\n"
+                "  处理：本地重跑 `python get_user_cookie.py` 生成新的串，"
+                "更新仓库 Secret %s（注意 Secret 名不要写错）" % (USER_COOKIE_ENV, reason, USER_COOKIE_ENV))
+
+        self._log("warning",
+                  "未配置 %s —— 将走「浏览器破门」。"
+                  "实测：GitHub Runner 的机房 IP 会被 Turnstile 降级，"
+                  "这道门在 CI 上几乎不可能自动通过（日志里会一直停在 interaction_required）。"
+                  "强烈建议配置 %s。" % (USER_COOKIE_ENV, USER_COOKIE_ENV))
+
         # 路线 B：之前破门导出的放行 Cookie
         if self.try_preset_cookie(http):
             return "cookie"
@@ -1219,7 +1431,14 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
                 http.set_user_agent(spider_ua)
                 return SPIDER_OK
 
-        raise GateError("无法通过站点验证门，本次任务中止")
+        raise GateError(
+            "无法通过站点验证门，本次任务中止。\n"
+            "  站点装的是 dev8133_cloudflare（Turnstile 人机验证）。已经穷尽以下手段：\n"
+            "    1) 爬虫 UA 白名单   —— 只能读，拿不到登录验证码，无法登录\n"
+            "    2) 浏览器过 Turnstile —— 机房 IP 被降级，实测必停在 interaction_required\n"
+            "    3) 打码平台         —— 未配置 CAPSOLVER_KEY\n"
+            "  唯一实测可行且免费的做法：配置 %s（详见 README「第三步」）。\n"
+            "  诊断明细已写入 gate_debug.txt（CI 的 Artifact 里可下载）。" % USER_COOKIE_ENV)
 
     # -- 登录链路自检（不需要账号密码）-----------------------------------
 
@@ -1363,6 +1582,10 @@ def main():
                         help="破门后验证登录页 + 验证码图片是否可达")
     parser.add_argument("--capsolver", default=None, help="直接用 CapSolver key 破门")
     parser.add_argument("--chrome", default=None, help="Chrome 可执行文件路径")
+    parser.add_argument("--verify-cookie", action="store_true",
+                        help="只检查 GM_USER_COOKIE 是否有效（配 Secret 前后各跑一次）")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="不做浏览器破门（CI 上省时间，直接判定失败）")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1377,6 +1600,35 @@ def main():
     if args.headed:
         gate.headless = False
 
+    # 无论干什么都先把 Cookie 的「长度 + 指纹」打出来。
+    # 这一行是整个排查体系的锚点：CI 里拿它和本地生成时打印的指纹对一下，
+    # 立刻能分辨「Secret 没生效（空/名字错/放进了 Variables）」还是「真的过期了」。
+    raw_cookie = os.getenv(USER_COOKIE_ENV)
+    parsed_cookie = parse_cookie_header(raw_cookie)
+    print("[Cookie] %s: 长度=%d 指纹=%s 解析出 %d 项"
+          % (USER_COOKIE_ENV, len((raw_cookie or "").strip()),
+             cookie_fingerprint(raw_cookie), len(parsed_cookie)))
+    if not (raw_cookie or "").strip():
+        print("         → 未生效：Secret 名写错 / 加到了 Variables 而非 Secrets / 该步骤没注入 env")
+
+    # --verify-cookie：只验 Cookie，不做别的。用来在本地确认「这串能不能用」，
+    # 以及确认 CI 里 Secret 是不是真的注入了（对指纹即可）。
+    if args.verify_cookie:
+        if not raw_cookie or not raw_cookie.strip():
+            print("  → 环境变量为空：Secret 名写错 / 没配 / 该步骤没注入 env")
+            return 1
+        if not parsed_cookie:
+            print("  → 解析不出任何 Cookie：粘贴内容被截断了")
+            return 1
+        print("  → Cookie 名: %s" % ", ".join(sorted(parsed_cookie)))
+        ok = gate.try_user_cookie(http)
+        gate.close()
+        if ok:
+            print("  → 结果：有效，已登录 uid=%s" % gate.logged_uid)
+            return 0
+        print("  → 结果：无效（状态=%s），请看上面那条 error/warning" % gate.user_cookie_state)
+        return 1
+
     how = None
 
     # 顺序与 ensure_access() 完全一致：用户 Cookie -> 过门 Cookie -> 现场破门
@@ -1385,6 +1637,9 @@ def main():
         print("\n[门口状态] 路线A 用户 Cookie —— 已是登录态（uid=%s），跳过 Turnstile 与验证码"
               % gate.logged_uid)
         how = "用户 Cookie（%s）" % USER_COOKIE_ENV
+    elif gate.user_cookie_state in ("broken", "expired", "gated"):
+        print("\n[门口状态] 路线A 失败：%s 已配置但不可用（状态=%s）"
+              % (USER_COOKIE_ENV, gate.user_cookie_state))
     elif gate.try_preset_cookie(http):
         print("\n[门口状态] 路线A' 过门 Cookie 有效（%s）" % COOKIE_ENV)
         how = "预置 Cookie（%s）" % COOKIE_ENV
@@ -1411,6 +1666,8 @@ def main():
             print("[浏览器破门] %s" % ("成功" if ok else "失败"))
         except GateError as exc:
             print("[浏览器破门失败] %s" % exc)
+    elif args.no_browser:
+        print("[跳过] --no-browser：不做浏览器破门")
     else:
         print("[提示] 未指定 --solve / --capsolver，只做探测。"
               "若已配置 %s / %s 会自动复用。"
@@ -1439,6 +1696,11 @@ def main():
 
     gate.close()
 
+    # 退出码有意义，CI 里才能靠它判断（别再出现「失败了但 job 是绿的」）
+    if how:
+        return 0
+    return 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
