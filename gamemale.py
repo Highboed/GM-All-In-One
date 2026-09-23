@@ -24,12 +24,29 @@ GM-All-In-One（修复版）—— GameMale 论坛签到一条龙
 [新增] 运行失败也会发一封说明邮件（原版失败时静默）。
 [新增] --check 自检模式：只破门 + 登录 + 抓资产，不发邮件，用于首次部署验证。
 
+[新增·第二期] 过门路线重排（理由见 gm_gate.py 顶部）
+    路线 A  GM_USER_COOKIE（推荐）：蜘蛛 UA + 你自己的登录 Cookie，
+            **完全不碰 Turnstile、不需要验证码、不需要浏览器**。
+    路线 B  CAPSOLVER_KEY：打码平台解 Turnstile → 提交换放行 Cookie → HTTP 登录（验证码走 ddddocr）。
+    路线 C  浏览器破门（xvfb + 有头 Chrome）：兜底。实测受出口 IP 信誉影响很大。
+
 用法
 ----
-    GM_USERNAME / GM_PASSWORD                                必需
+    GM_USERNAME / GM_PASSWORD                                必需（路线 A 下仅用于兜底登录）
+    GM_USER_COOKIE                                           强烈推荐（见下方说明）
     GM_SMTP_HOST / GM_MAIL_USER / GM_MAIL_PASS / GM_MAIL_TO   可选，缺省则不发邮件
+    CAPSOLVER_KEY                                            可选，打码平台兜底
     （兼容上游旧变量名 USERNAME / PASSWORD / SMTP_HOST / MAIL_USER / MAIL_PASS / MAIL_TO；
       注意 Windows 上 USERNAME 是系统内置变量，本地务必用 GM_USERNAME）
+
+    关于 GM_USER_COOKIE —— 怎么拿？
+      在自己电脑的浏览器里正常登录 www.gamemale.com，然后：
+        F12 → 网络(Network) → 随便点一个 gamemale.com 的请求
+        → 请求头(Request Headers) → 复制整行 Cookie: 后面的值
+      （也可以在 应用/Application → Cookies → https://www.gamemale.com 里
+        找 TVj0_2132_auth、TVj0_2132_saltkey、TVj0_2132_sid 拼成 name=value; name=value）
+      粘贴时必须带上，否则服务端认不出登录态。
+      有效期约 30 天（登录时 cookietime=2592000），过期后重新复制一次即可。
 
     python gamemale.py            正常运行
     python gamemale.py --check    自检：破门 + 登录 + 抓资产，不发邮件
@@ -49,6 +66,9 @@ from email.utils import formataddr
 
 from gm_gate import (
     DEFAULT_HOST,
+    SPIDER_BLOCKED_PATHS,
+    USER_COOKIE_ENV,
+    USER_COOKIE_MODE,
     GateError,
     GateKeeper,
     GatedSession,
@@ -136,6 +156,7 @@ class Gamemale:
         self.logged_in = False
         self.gate_mode = "unknown"
         self.fatal_error = None
+        self.spider_mode = False   # 蜘蛛 UA + 用户 Cookie：misc.php 不可用，登录流程整体跳过
 
         self.sign_result = "未执行"
         self.exchange_result = "未执行"
@@ -190,11 +211,25 @@ class Gamemale:
         self.main_logger.info("验证门处理完成，模式: %s" % self.gate_mode)
         self.http.set_referer(self._url("/forum.php"))
 
+        if self.gate_mode == USER_COOKIE_MODE:
+            # 路线 A：Cookie 已经带着登录态，后面直接跳过登录
+            self.logged_in = True
+            self.spider_mode = True
+            self.http.set_referer(self._url("/forum.php"))
+            if not self.refresh_formhash():
+                self.main_logger.warning("用户 Cookie 模式下未取到 formhash，写操作可能失败")
+            return True
+
         if self.gate_mode == "spider":
-            # 爬虫白名单能读，但登录验证码接口被 403 封死，无法完成登录
-            self.fatal_error = ("站点验证门只放行了爬虫 UA，而 misc.php?mod=seccode 对爬虫 UA "
-                                "返回 403，无法完成登录。请排查浏览器破门为何未生效"
-                                "（GM_HEADLESS / xvfb / GM_CHROME_PATH）。")
+            # 爬虫白名单能读能写，但 misc.php 整个文件 403 —— 所以拿不到登录验证码。
+            # 没有登录 Cookie 时这里就是死路，必须点明原因。
+            self.fatal_error = (
+                "站点验证门只放行了爬虫 UA，登录验证码接口 misc.php 对爬虫 UA 返回 403，"
+                "无法完成登录。\n"
+                "  两条出路：\n"
+                "    1) 推荐：设置 %s（你自己浏览器的登录 Cookie），全程不必碰 Turnstile；\n"
+                "    2) 或者排查浏览器破门为何没生效（GM_HEADLESS / xvfb / GM_CHROME_PATH），"
+                "或配置 CAPSOLVER_KEY 走打码平台。" % USER_COOKIE_ENV)
             self.main_logger.error(self.fatal_error)
             return False
         return True
@@ -263,6 +298,12 @@ class Gamemale:
         if self.ocr is None:
             return ""
         modid = modid or "member::logging"
+        if self.spider_mode:
+            # 蜘蛛 UA 下 misc.php 整个文件被插件 403，取图必失败，直接点明不要白试 8 轮
+            self.login_logger.error(
+                "当前是蜘蛛 UA 模式，misc.php 被站点 403 封死，无法获取验证码图片。"
+                "请改用 GM_USER_COOKIE（自带登录态，无需验证码）")
+            return ""
         if not seccodehash:
             self.login_logger.error("没有 idhash，无法取验证码")
             return ""
@@ -733,10 +774,15 @@ class Gamemale:
         try:
             if not self.connect():
                 ok = False
-            elif not self.login():
+            elif not self.logged_in and not self.login():
                 self.fatal_error = self.fatal_error or "登录失败"
                 ok = False
             else:
+                if self.logged_in and self.gate_mode == USER_COOKIE_MODE:
+                    self.main_logger.info(
+                        "用户 Cookie 模式：已带登录态，跳过登录流程"
+                        "（因此不会触碰被 403 封死的 %s）"
+                        % ", ".join(SPIDER_BLOCKED_PATHS))
                 if self.run_mode in ("light", "check"):
                     self.main_logger.info("%s 模式：跳过签到/抽奖/互动，仅抓取资产" % self.run_mode)
                 else:
