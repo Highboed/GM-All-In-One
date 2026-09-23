@@ -26,14 +26,41 @@ www.gamemale.com 在 Discuz 之上装了第三方插件 `dev8133_cloudflare`，�
    YisouSpider / Bytespider（不放行 YandexBot 与普通浏览器 UA）。用 Baiduspider UA 时，
    forum.php / member.php / home.php / plugin.php?id=k_misign:sign / space-uid-*.html
    **全部 200 且不设防** —— 也就是说白名单 UA 能读完整个站点，连签到插件页都能打开。
-2. **但 `misc.php?mod=seccode`（登录验证码图片）对全部白名单 UA 返回 403（空 body）**。
-   这是站点**刻意**封死的：让你能读、不能登。纯 HTTP 登录这条路被掐断。
-3. **移动端 API `api/mobile/index.php` 完全不受门保护**（`module=check` 返回
+2. **`misc.php` 整个文件对全部白名单 UA 返回 403（空 body）**。
+   不只是 seccode —— `misc.php?mod=faq` 也是 403，说明拦截粒度是「路径」而不是「参数」。
+   大小写 / 双斜杠 / `/.` / `/foo/..` / PATH_INFO / `%20` / POST 全试过，一律 403。
+   后果：登录验证码图片拿不到 → **蜘蛛 UA 无法完成登录**。
+3. **但白名单 UA 的 POST 是放行的**（这一点极关键）：
+       POST /member.php?...loginsubmit=yes  → 200，业务层回「抱歉，验证码填写错误」
+       POST /plugin.php?id=k_misign:sign    → 200，业务层回「您所在用户组不允许使用」
+   也就是说插件**只挡 misc.php**，写操作本身不挡。
+   ⇒ 只要手上有一枚**已登录的 Discuz Cookie**，蜘蛛 UA 就能把整套签到做完，
+     **完全不需要 Turnstile、不需要验证码、不需要浏览器**（见下面的「用户 Cookie 模式」）。
+4. **移动端 API `api/mobile/index.php` 完全不受门保护**（`module=check` 返回
    `{"testcookie":null}`，`module=register` 返回移动版注册页），
    但 `module=login` / `module=seccode` 返回 **0 字节** —— 站点把这两个模块摘掉了。
-   所以「借用 App 接口免验证码登录」这条捷径也被堵死。
+5. **过门校验接口 `/plugin.php?id=dev8133_cloudflare` 自己不受门保护**，
+   对它 POST 假 token 会返回 `{"code":-1,...,"error_code":"invalid-input-response"}`。
+   ⇒ 打码平台（CapSolver）可以在**它自己的 IP** 上解出 token，我们再从任意 IP 提交换放行 Cookie。
+     （代价：一条 CapSolver key，约 $0.001/次）
 
-结论：**必须用真实浏览器过一次 Turnstile**，拿到被放行的会话 Cookie，再回到 HTTP 通道跑业务。
+三条可行路线（按推荐度排序，代码里都有）
+----------------------------------------
+  A. **用户 Cookie 模式**（最稳、免费、零浏览器）
+     `GM_USER_COOKIE` = 你自己浏览器里的登录 Cookie（`TVj0_2132_auth` 等，有效期 30 天）
+     配好后：蜘蛛 UA 过门 + 已有登录态 ⇒ 只跑业务请求。**完全不碰 Turnstile**。
+  B. **打码平台模式**（全自动，付费）
+     `CAPSOLVER_KEY` ⇒ 解 Turnstile → 提交校验接口换放行 Cookie → 走 HTTP 登录（验证码交给 ddddocr）。
+  C. **浏览器模式**（兜底，最不稳）
+     xvfb + 有头 Chrome 现场过 Turnstile。实测受出口 IP 信誉影响很大（见下面第四节）。
+
+⚠️ 关于路线的稳定性（实测结论）
+--------------------------------
+  * 放行 Cookie 寿命很短：15:22 导出的串，18:25 已失效（同一台机器、同一出口 IP），
+    所以**不要指望「本地破门一次、CI 用一个月」**。
+  * 本机反复自动化探测后，连**有头浏览器**都过不了门了（Turnstile 一直停在
+    interaction_required，且 iframe 不渲染）——出口 IP 信誉被降级。
+  * 因此：A > B > C。C 只作为最后的兜底。
 
 三、为什么之前一直失败（真正的根因）
 ------------------------------------
@@ -85,6 +112,16 @@ VERIFY_PATH = "/plugin.php?id=dev8133_cloudflare"
 # Cookie 复用（CI 免起浏览器）
 COOKIE_ENV = "GM_GATE_COOKIE"
 
+# 用户自己的登录 Cookie（最稳的一条路：蜘蛛 UA + 已有登录态，全程不碰 Turnstile）
+USER_COOKIE_ENV = "GM_USER_COOKIE"
+SPIDER_UA_ENV = "GM_SPIDER_UA"
+
+# 蜘蛛 UA 下被插件封死的路径（前缀匹配）。用到这里要提前报错，别等 403 才猜。
+SPIDER_BLOCKED_PATHS = ("misc.php",)
+
+# 登录态判定：Discuz 会在页面里输出 discuz_uid
+UID_RE = re.compile(r"discuz_uid\s*=\s*['\"]?(\d+)")
+
 CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -118,6 +155,7 @@ OPEN = "open"              # 门没开（站点未启用插件），普通 UA �
 SPIDER_OK = "spider"       # 门开着，爬虫白名单可通行（**只能读，无法登录**）
 NEED_BROWSER = "browser"   # 必须真实浏览器过 Turnstile
 UNKNOWN = "unknown"        # 网络异常，无法判定
+USER_COOKIE_MODE = "user_cookie"   # 蜘蛛 UA + 用户自己的登录 Cookie，全程不碰 Turnstile
 
 
 class GateError(Exception):
@@ -148,6 +186,45 @@ def decode_cookie_blob(blob):
     if isinstance(data.get("cookies"), dict):
         return (data.get("ua") or CHROME_UA), data["cookies"]
     return CHROME_UA, data
+
+
+def parse_cookie_header(raw):
+    """
+    把浏览器里复制出来的 `Cookie:` 头解析成字典。
+
+    兼容几种常见粘贴形态：
+        a=1; b=2
+        Cookie: a=1; b=2
+        a=1;\nb=2
+    值里含 '=' 也能正确切分（只在第一个 '=' 处切）。
+    """
+    if not raw:
+        return {}
+    txt = raw.strip()
+    if txt.lower().startswith("cookie:"):
+        txt = txt.split(":", 1)[1]
+    txt = txt.replace("\r", " ").replace("\n", " ")
+    out = {}
+    for part in txt.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip()
+        if name:
+            out[name] = value.strip()
+    return out
+
+
+def detect_uid(html):
+    """从页面里读出 discuz_uid。游客是 0，已登录是真实 uid。读不到返回 None。"""
+    m = UID_RE.search(html or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------- HTTP 引擎
@@ -324,6 +401,14 @@ class GateKeeper:
         self._profile_dir = None
         self._passed_via_http = False   # 是否靠「抓 token 走 HTTP」过的门
         self.gate_cookie_blob = None    # 过门后导出的 Cookie 串
+        self.gate_mode = None           # 最终采用的过门方式（user_cookie / browser / ...）
+        self.logged_uid = None          # 用户 Cookie 模式下的已登录 uid
+
+    def url(self, path):
+        """拼绝对地址。path 需以 / 开头。"""
+        if path.startswith("http"):
+            return path
+        return "https://%s%s" % (self.hostname, path)
 
     # -- 基础 ------------------------------------------------------------
 
@@ -426,7 +511,9 @@ class GateKeeper:
 
         orig_ua = http.user_agent
         try:
-            code, gated, size = self._probe(http)
+            # 基准探测**显式**用普通浏览器 UA：不能依赖 session 里当前的 UA，
+            # 因为前面若借用过蜘蛛 UA（或调用方设置了别的 UA），会把「门是否开着」判错。
+            code, gated, size = self._probe(http, ua=CHROME_UA)
             if code == 0:
                 self.state = UNKNOWN
                 self._log("error", "无法连接 %s，请检查网络" % self.hostname)
@@ -445,9 +532,10 @@ class GateKeeper:
                 if code2 == 200 and not gated2:
                     self.state = SPIDER_OK
                     self.spider_ua_name = name
-                    self._log("info", "爬虫白名单命中：%s（HTTP %s, %d 字节）—— 但该 UA 拿不到"
-                                      "登录验证码图片（misc.php?mod=seccode 返回 403），"
-                                      "只能读页面，仍需浏览器破门" % (name, code2, size2))
+                    self._log("info", "爬虫白名单命中：%s（HTTP %s, %d 字节）—— 页面与 POST "
+                                      "都放行，但 misc.php 整个文件 403，"
+                                      "所以拿不到登录验证码；要登录需 %s 或过 Turnstile"
+                                      % (name, code2, size2, USER_COOKIE_ENV))
                     break
                 self._log("debug", "  白名单未命中: %s (HTTP %s)" % (name, code2))
             else:
@@ -968,6 +1056,81 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
 
     # -- 统一出口 ---------------------------------------------------------
 
+    # -- 路线 A：用户自己的登录 Cookie（最稳，零浏览器）------------------
+
+    @staticmethod
+    def spider_ua():
+        """取蜘蛛 UA。可用 GM_SPIDER_UA 覆盖；默认 Baiduspider（实测最稳）。"""
+        custom = (os.getenv(SPIDER_UA_ENV) or "").strip()
+        if custom:
+            return custom
+        return dict(SPIDER_UAS)["Baiduspider"]
+
+    def try_user_cookie(self, http):
+        """
+        用 `GM_USER_COOKIE` 里的登录 Cookie + 蜘蛛 UA 直接开跑。
+
+        为什么这条路最稳：
+          * 蜘蛛 UA 让插件的门形同虚设（POST 也放行，只挡 misc.php）
+          * 登录态由 Cookie 提供，**不需要验证码图片**（那正是被 403 的那个接口）
+          * 不启动浏览器、不需要打码平台、不受出口 IP 信誉影响
+
+        代价：Cookie 是你在自己浏览器里登录后复制出来的，30 天后要换一次。
+        返回 True 表示可用。
+        """
+        raw = os.getenv(USER_COOKIE_ENV)
+        if not raw:
+            return False
+
+        cookies = parse_cookie_header(raw)
+        if not cookies:
+            self._log("warning", "%s 解析后是空的，请检查粘贴内容" % USER_COOKIE_ENV)
+            return False
+
+        ua = self.spider_ua()
+        # 失败时必须把 UA 还原，否则会把「借来的蜘蛛 UA」留给后面的 classify，
+        # 让 classify 误判成「OPEN —— 普通 UA 可直连」（这个坑实测踩到过）。
+        orig_ua = http.user_agent
+
+        http.clear_cookies()
+        http.set_user_agent(ua)
+        http.set_cookies(cookies)
+        http.set_referer(self.forum_url)
+        self._log("info", "发现 %s（%d 项 Cookie），按「用户 Cookie 模式」直连"
+                  % (USER_COOKIE_ENV, len(cookies)))
+        self._log("debug", "Cookie 名单: %s" % ", ".join(sorted(cookies)))
+
+        try:
+            resp = http.get(self.url("/home.php?mod=spacecp"))
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "用户 Cookie 验证请求异常: %r" % exc)
+            http.clear_cookies()
+            http.set_user_agent(orig_ua)
+            return False
+
+        body = resp.text or ""
+        if is_gated(body):
+            self._log("warning", "用户 Cookie 模式下仍被拦门（说明 GM_SPIDER_UA 不在白名单）")
+            http.clear_cookies()
+            http.set_user_agent(orig_ua)
+            return False
+
+        uid = detect_uid(body)
+        if uid:
+            self._log("info", "用户 Cookie 有效，已登录 uid=%d —— 跳过浏览器与验证码" % uid)
+            self.state = OPEN
+            self.gate_mode = USER_COOKIE_MODE
+            self.logged_uid = uid
+            return True   # 成功时保留蜘蛛 UA（后续请求都要用它）
+
+        self._log("warning",
+                  "用户 Cookie 已失效（服务端认为未登录）。"
+                  "请重新在浏览器登录 %s 后复制新的 Cookie 串更新 %s"
+                  % (self.hostname, USER_COOKIE_ENV))
+        http.clear_cookies()
+        http.set_user_agent(orig_ua)
+        return False
+
     def try_preset_cookie(self, http):
         """
         先试 GM_GATE_COOKIE（CI 上可以完全跳过浏览器）。
@@ -1006,8 +1169,13 @@ return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
     def ensure_access(self, http):
         """
         保证 http 引擎可以正常访问站点。
-        :return: 使用的方式（cookie / open / spider / browser / capsolver）
+        :return: 使用的方式（user_cookie / cookie / open / spider / browser / capsolver）
         """
+        # 路线 A：用户自己的登录 Cookie（蜘蛛 UA，全程不碰 Turnstile）—— 最稳，优先
+        if self.try_user_cookie(http):
+            return USER_COOKIE_MODE
+
+        # 路线 B：之前破门导出的放行 Cookie
         if self.try_preset_cookie(http):
             return "cookie"
 
@@ -1209,12 +1377,26 @@ def main():
     if args.headed:
         gate.headless = False
 
-    state = gate.classify(http)
-    print("\n[门口状态] %s" % state)
-
     how = None
-    if gate.try_preset_cookie(http):
+
+    # 顺序与 ensure_access() 完全一致：用户 Cookie -> 过门 Cookie -> 现场破门
+    # 路线 A：用户自己的登录 Cookie（命中就完全不必碰 Turnstile）
+    if gate.try_user_cookie(http):
+        print("\n[门口状态] 路线A 用户 Cookie —— 已是登录态（uid=%s），跳过 Turnstile 与验证码"
+              % gate.logged_uid)
+        how = "用户 Cookie（%s）" % USER_COOKIE_ENV
+    elif gate.try_preset_cookie(http):
+        print("\n[门口状态] 路线A' 过门 Cookie 有效（%s）" % COOKIE_ENV)
         how = "预置 Cookie（%s）" % COOKIE_ENV
+
+    if how:
+        state = OPEN
+    else:
+        state = gate.classify(http)
+        print("\n[门口状态] %s" % state)
+
+    if how:
+        pass
     elif args.capsolver:
         try:
             ok = gate.solve_with_capsolver(http, args.capsolver)
@@ -1231,7 +1413,8 @@ def main():
             print("[浏览器破门失败] %s" % exc)
     else:
         print("[提示] 未指定 --solve / --capsolver，只做探测。"
-              "若已配置 GM_GATE_COOKIE 会自动复用。")
+              "若已配置 %s / %s 会自动复用。"
+              % (USER_COOKIE_ENV, COOKIE_ENV))
 
     if how:
         print("[过门方式] %s" % how)
