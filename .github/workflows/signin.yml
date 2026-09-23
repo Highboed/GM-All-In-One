@@ -151,8 +151,9 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # v1.1 起基准文件是 asset_record.json（金币/血液/积分 + 日期）；
+          # v1.1 起基准文件是 asset_record.json（金币/血液/积分 + 日期 + 账号归属指纹）；
           # 旧的纯数字 gold_record.txt 仍会被脚本读取（迁移期），一并纳入提交范围。
+          # 归属指纹（_owner）不可逆、不含 uid/用户名原文，用途见 README「第六步」。
           # 注意用 if 而不是 `[ -f ] && git add`：run 默认带 -e，
           # 后者在文件不存在时会返回非零把整个 step 判失败。
           for f in asset_record.json gold_record.txt; do
