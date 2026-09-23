@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GM-All-In-One（修复版）—— GameMale 论坛签到一条龙
+GM-All-In-One v1.1 —— GameMale 论坛签到一条龙
 
 与上游原版的差异（修复纲要）
 ================================================================
@@ -50,10 +50,25 @@ GM-All-In-One（修复版）—— GameMale 论坛签到一条龙
 
     python gamemale.py            正常运行
     python gamemale.py --check    自检：破门 + 登录 + 抓资产，不发邮件
+
+更新记录
+--------
+v1.1（第一次更新，2026-09-23）
+  1. 邮件报告恢复 emoji 展示，署名改为「GM-All-In-One v1.1」。
+  2. 资产对比从「只有金币」扩展为「金币 + 血液」都比对上次；首次运行不会报错。
+  3. 新增积分与等级展示（🏅 积分 / 🎖️ Lvl. N）。
+  4. 新增「还要献祭多少血液才能升级」的估算（1 积分 ≈ 34 血液）。
+  5. 基准文件 gold_record.txt（纯数字）→ asset_record.json（可存多项，带日期），
+     旧文件仍可读取，首次迁移不会丢基准。
+  6. 基准文件带「账号指纹」归属标识：别人克隆/复刻本仓库后，第一次运行不会把
+     你的金币/血液/积分当成他的基准（否则会显示一个虚假的大额涨跌）。
+     空文件/损坏文件不再连带跳过旧 gold_record.txt 的兼容读取。
 """
 
 import argparse
+import datetime
 import hashlib
+import json
 import logging
 import os
 import re
@@ -85,7 +100,42 @@ else:
     _DDDDOCR_IMPORT_ERROR = None
 
 DEFAULT_UIDS = [730713, 62445, 61832]
-ASSET_ITEMS = ["金币", "血液", "旅程", "追随", "知识", "咒术", "堕落", "灵魂"]
+# 「积分」在积分页不一定出现，抓不到时会自动补抓一次空间首页（见 fetch_assets）
+ASSET_ITEMS = ["金币", "血液", "旅程", "追随", "知识", "咒术", "堕落", "灵魂", "积分"]
+# 需要做「较上次」对比的项
+TRACKED_ITEMS = ["金币", "血液", "积分"]
+
+VERSION = "v1.1"
+
+# ---- 等级门槛（下标即为等级号）----
+# 用户提供：lv0-0 lv1-3 lv2-10 lv3-35 lv4-? lv5-120 lv6-200 lv7-300 lv8-450 lv9-650 lv10-900
+# 原稿 lv4 写作 14，与「门槛单调递增」矛盾（14 < 35），此处按序列取 70。
+# 它只影响「积分落在 35~120 之间时显示的当前等级」；若与站内实际不符，直接改这一行即可。
+LEVEL_THRESHOLDS = [0, 3, 10, 35, 70, 120, 200, 300, 450, 650, 900]
+
+# ---- 献祭换算 ----
+# 献祭血液 → 增加旅程，1 点旅程 = 1 点积分。原始税率 15%（33.5 血液 = 1 旅程），
+# 按实测「暴力」口径取整为 34 血液 = 1 积分。
+BLOOD_PER_POINT = 34
+
+# 资产基准文件：v1.1 起用 JSON（可同时记录金币/血液/积分），旧的纯数字文件仍兼容读取
+ASSET_RECORD_JSON = "asset_record.json"
+ASSET_RECORD_LEGACY = "gold_record.txt"
+
+# ---- 基准文件「归属标识」----
+# 基准文件是要提交进仓库的（否则 Actions 每次都是全新环境，没法对比昨天）。
+# 于是有人克隆/复刻这个仓库后，第一次运行会读到**别人的**基准，报告里就会出现
+# 一个莫名其妙的大额涨跌（比如「金币 200（较上次 -1549）」）。
+# 解决：写入时附带一组当前账号的**指纹**，读取时对不上就整份忽略、按「首次记录」处理。
+# 只存哈希、不含 uid / 用户名明文 —— 但盐是公开的，所以它只负责「归属比对」，不承担保密职责。
+ASSET_OWNER_SALT = "GM-All-In-One/asset-record/v1"
+# 这些是占位值，不能当身份来源（否则不同用户会撞成同一个指纹）
+OWNER_PLACEHOLDER_NAMES = {
+    "placeholder", "test", "username", "your_username", "yourname", "your_name",
+    "example", "none", "null", "changeme", "gm_username", "account", "user",
+}
+UID_RE = re.compile(r"discuz_uid\s*=\s*['\"]?(\d+)")
+UID_HOME_RE = re.compile(r"home\.php\?mod=space&(?:amp;)?uid=(\d+)")
 
 
 # =============================================================== 工具函数
@@ -127,6 +177,143 @@ def parse_uids(raw):
     return out or list(DEFAULT_UIDS)
 
 
+# ------------------------------------------------ v1.1 新增：积分 / 等级 / 基准
+
+
+def level_of(points):
+    """按 LEVEL_THRESHOLDS 返回 (当前等级号, 本级门槛, 下一级门槛或 None)。"""
+    lv = 0
+    for i, threshold in enumerate(LEVEL_THRESHOLDS):
+        if points >= threshold:
+            lv = i
+        else:
+            break
+    nxt = LEVEL_THRESHOLDS[lv + 1] if lv + 1 < len(LEVEL_THRESHOLDS) else None
+    return lv, LEVEL_THRESHOLDS[lv], nxt
+
+
+def fmt_growth(cur, prev):
+    """生成「（较上次 +N）」后缀。首次记录没有基准时返回「（首次记录）」而不是报错。"""
+    if cur is None:
+        return ""
+    if prev is None:
+        return " （首次记录）"
+    delta = cur - prev
+    return " （较上次 +%d）" % delta if delta >= 0 else " （较上次 %d）" % delta
+
+
+def asset_owner_fp(kind, value):
+    """把身份压成不可逆短指纹（只用于比对，不能反推出 uid / 用户名）。"""
+    raw = ("%s|%s|%s" % (ASSET_OWNER_SALT, kind, value)).encode("utf-8")
+    return "%s:%s" % (kind, hashlib.sha1(raw).hexdigest()[:10])
+
+
+def build_asset_owner(uid=None, username=None):
+    """生成本次运行的归属指纹集合。取不到任何身份就返回空列表。"""
+    ids = set()
+    if uid:
+        ids.add(asset_owner_fp("uid", str(uid)))
+    name = str(username or "").strip()
+    if name and name.lower() not in OWNER_PLACEHOLDER_NAMES:
+        ids.add(asset_owner_fp("user", name.lower()))
+    return sorted(ids)
+
+
+def asset_owner_matches(stored, current):
+    """
+    基准文件是不是本账号的？
+
+    信息不足时（文件里没记 / 这次算不出来）一律放行 —— 宁可少拦一次，
+    也不能让正常用户因为某次读不到 uid 就被反复重置基准。
+    两边都有信息时取交集：任一项对上就算自己（用户改名、换登录方式都不会误伤）。
+    """
+    if not stored or not current:
+        return True
+    if isinstance(stored, str):
+        stored = [stored]
+    try:
+        return bool(set(stored) & set(current))
+    except TypeError:
+        return True
+
+
+def detect_uid_in_html(html):
+    """从页面里读 discuz_uid。游客(0)不算命中，读不到返回 None。"""
+    for pattern in (UID_RE, UID_HOME_RE):
+        m = pattern.search(html or "")
+        if not m:
+            continue
+        try:
+            uid = int(m.group(1))
+        except ValueError:
+            continue
+        if uid > 0:
+            return uid
+    return None
+
+
+def load_asset_record(logger=None, owner_ids=None):
+    """
+    读取上次的资产基准。以下三种情况都按「首次记录」处理，**绝不抛错**：
+
+      1. 文件不存在 / 是空的 / 内容损坏 / 类型不对；
+      2. 文件属于**别的账号**（克隆、复刻别人仓库后第一次运行的常见情况）——
+         否则会把别人的金币/血液当成自己的基准，报告里冒出一个大额虚假涨跌；
+      3. 只有 v1.0 的旧 gold_record.txt（迁移期只取金币）。
+
+    注意 1 和 3 的关系：JSON 只是「空的/坏的」时，仍要继续尝试旧的 gold_record.txt。
+    早先用 if/elif 写会把这两条互斥掉 —— 一个 0 字节的 JSON 就能让老用户的
+    金币基准凭空消失，所以这里改成了「先试 JSON，不可用了再试旧文件」。
+    """
+    rec, json_usable = {}, False
+
+    if os.path.exists(ASSET_RECORD_JSON):
+        data = None
+        try:
+            with open(ASSET_RECORD_JSON, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            if logger:
+                logger.warning("读取 %s 失败（按首次记录处理）: %r" % (ASSET_RECORD_JSON, exc))
+
+        if isinstance(data, dict) and data:
+            if asset_owner_matches(data.get("_owner"), owner_ids):
+                rec, json_usable = data, True
+            else:
+                # 归属不符：连旧的 gold_record.txt 一起忽略（同一个仓库里的都是别人的）
+                if logger:
+                    logger.info("基准文件 %s 记录的是其它账号（克隆/复刻仓库时常见），"
+                                "本次全部按「首次记录」处理，运行结束会自动改写成本账号的基准"
+                                % ASSET_RECORD_JSON)
+                return {}
+        elif data is not None and logger:
+            logger.warning("%s 内容不是有效基准（按首次记录处理）" % ASSET_RECORD_JSON)
+
+    if not json_usable and os.path.exists(ASSET_RECORD_LEGACY):
+        # 兼容 v1.0 的纯数字 gold_record.txt（迁移期不丢金币基准）
+        try:
+            with open(ASSET_RECORD_LEGACY, "r", encoding="utf-8") as fh:
+                content = fh.read().strip()
+            if content.isdigit():
+                rec["金币"] = int(content)
+        except Exception as exc:  # noqa: BLE001
+            if logger:
+                logger.warning("读取 %s 失败: %r" % (ASSET_RECORD_LEGACY, exc))
+    return rec
+
+
+def save_asset_record(rec, logger=None):
+    """写入基准。失败只告警不抛错（下次会重新按首次记录处理）。"""
+    try:
+        with open(ASSET_RECORD_JSON, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, ensure_ascii=False, indent=2)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.warning("写入 %s 失败: %r" % (ASSET_RECORD_JSON, exc))
+        return False
+
+
 # =============================================================== 主体
 
 
@@ -157,6 +344,7 @@ class Gamemale:
         self.gate_mode = "unknown"
         self.fatal_error = None
         self.spider_mode = False   # 蜘蛛 UA + 用户 Cookie：misc.php 不可用，登录流程整体跳过
+        self.my_uid = None         # 本账号 uid（页面里读到就记下），用于基准文件归属校验
 
         self.sign_result = "未执行"
         self.exchange_result = "未执行"
@@ -643,6 +831,10 @@ class Gamemale:
         url = self._url("/home.php?mod=spacecp&ac=credit&op=base")
         try:
             res = self.sess.get(url).text or ""
+            # 顺手记下自己的 uid（页面里的 discuz_uid），用于给基准文件打归属标识
+            uid = detect_uid_in_html(res)
+            if uid:
+                self.my_uid = uid
             if is_gated(res):
                 self.assets_report = "资产抓取失败：被验证门拦截"
                 self.task_logger.error(self.assets_report)
@@ -675,44 +867,143 @@ class Gamemale:
                 return
 
             current_gold = assets["金币"]
-            last_gold = current_gold
-            if os.path.exists("gold_record.txt"):
-                try:
-                    with open("gold_record.txt", "r", encoding="utf-8") as fh:
-                        content = fh.read().strip()
-                    if content.isdigit():
-                        last_gold = int(content)
-                except Exception as exc:  # noqa: BLE001
-                    self.task_logger.warning("读取 gold_record.txt 失败: %r" % exc)
+            current_blood = assets.get("血液")
 
-            growth = current_gold - last_gold
-            growth_str = "+%d" % growth if growth >= 0 else str(growth)
+            # 积分：积分页不一定带这一项，抓不到就补抓一次空间首页（那里有「积分: N」）
+            credit = assets.get("积分")
+            if credit is None:
+                credit = self._fetch_credit_from_space()
+                if credit is not None:
+                    assets["积分"] = credit
+
+            # 读取上次基准（首次运行 / 文件损坏 / 别人仓库里的基准都不会报错，只是不显示增减）
+            owner_ids = build_asset_owner(self.my_uid, self.username)
+            if owner_ids:
+                self.task_logger.debug("本账号基准指纹: %s" % ",".join(owner_ids))
+            record = load_asset_record(self.task_logger, owner_ids)
+            prev = {}
+            for key in TRACKED_ITEMS:
+                raw = record.get(key)
+                prev[key] = int(raw) if isinstance(raw, int) else None
 
             # 仅在解析成功时回写基准，避免把 0 或错值写进去污染后续对比
-            try:
-                with open("gold_record.txt", "w", encoding="utf-8") as fh:
-                    fh.write(str(current_gold))
-            except Exception as exc:  # noqa: BLE001
-                self.task_logger.warning("写入 gold_record.txt 失败: %r" % exc)
+            new_record = {"date": datetime.date.today().isoformat(), "金币": current_gold}
+            if current_blood is not None:
+                new_record["血液"] = current_blood
+            if credit is not None:
+                new_record["积分"] = credit
+            # 归属指纹取并集：某次读不到 uid 不会抹掉已记录的指纹，
+            # 避免「这次认得出、下次认不出」导致基准被反复重置。
+            old_owner = record.get("_owner")
+            old_owner = [old_owner] if isinstance(old_owner, str) else list(old_owner or [])
+            merged_owner = sorted(set(owner_ids) | set(old_owner))
+            if merged_owner:
+                new_record["_owner"] = merged_owner
+            save_asset_record(new_record, self.task_logger)
 
             def v(k):
                 return assets[k] if assets[k] is not None else "?"
 
-            self.assets_report = (
-                "金币: %s (较上次 %s)\n"
-                "血液: %s | 旅程: %s | 追随: %s\n"
-                "知识: %s | 咒术: %s | 堕落: %s\n"
-                "灵魂: %s"
-                % (current_gold, growth_str, v("血液"), v("旅程"), v("追随"),
-                   v("知识"), v("咒术"), v("堕落"), v("灵魂"))
-            )
+            lines = [
+                "💰 金币: %s%s" % (current_gold, fmt_growth(current_gold, prev["金币"])),
+                "🩸 血液: %s%s" % (v("血液"), fmt_growth(current_blood, prev["血液"])),
+                "✈️ 旅程: %s  |  👣 追随: %s" % (v("旅程"), v("追随")),
+                "📚 知识: %s  |  🔮 咒术: %s" % (v("知识"), v("咒术")),
+                "🖤 堕落: %s  |  👻 灵魂: %s" % (v("堕落"), v("灵魂")),
+            ]
+
+            if credit is None:
+                lines.append("")
+                lines.append("🏅 积分: 未解析到"
+                             "（页面结构可能变化，可设 GM_DEBUG_ASSETS=1 导出页面核对）")
+            else:
+                lv, _cur_th, nxt_th = level_of(credit)
+                lines.append("")
+                lines.append("🏅 积分: %d%s  |  🎖️ 等级: Lvl. %d"
+                             % (credit, fmt_growth(credit, prev["积分"]), lv))
+                if nxt_th is None:
+                    lines.append("📈 已满级（Lvl. %d），无需再冲分 🎉" % lv)
+                else:
+                    need_point = nxt_th - credit
+                    need_blood = need_point * BLOOD_PER_POINT
+                    lines.append("📈 距 Lvl. %d 还需 %d 积分（门槛 %d）"
+                                 % (lv + 1, need_point, nxt_th))
+                    if current_blood is None:
+                        lines.append("🔥 献祭估算: 约需 %d 血液"
+                                     "（按 1 积分 = %d 血液折算）"
+                                     % (need_blood, BLOOD_PER_POINT))
+                    elif current_blood >= need_blood:
+                        lines.append("🔥 献祭估算: 约需 %d 血液 → 当前 %d 点，"
+                                     "血量足够，献祭即可升级 ✅" % (need_blood, current_blood))
+                    else:
+                        lines.append("🔥 献祭估算: 约需 %d 血液 → 当前 %d 点，尚差 %d ⏳"
+                                     % (need_blood, current_blood, need_blood - current_blood))
+
+            self.assets_report = "\n".join(lines)
             self.assets_ok = True
         except Exception as exc:  # noqa: BLE001
             self.assets_report = "资产抓取异常: %r" % exc
             self.task_logger.error(self.assets_report)
         self.task_logger.info("当前账户综合看板:\n%s" % self.assets_report)
 
+    def _fetch_credit_from_space(self):
+        """
+        从空间首页补抓「积分」（v1.1 新增）。
+
+        积分页（spacecp&ac=credit&op=base）不一定列出「积分」这一项，
+        而空间首页的「统计信息」区块里是明确有的（形如「积分: 126 | 旅程: 93」）。
+        全程只读；失败仅告警并返回 None，不影响主流程与邮件发送。
+        """
+        try:
+            res = self.sess.get(self._url("/home.php?mod=space")).text or ""
+            uid = detect_uid_in_html(res)
+            if uid:
+                self.my_uid = uid
+            if is_gated(res):
+                self.task_logger.warning("空间首页被验证门拦截，积分未能补抓")
+                return None
+            text = re.sub(r"<script.*?</script>", " ", res, flags=re.S | re.I)
+            text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"&nbsp;?", " ", text)
+            m = re.search(r"积分\s*[:：=]?\s*(\d{1,9})", text)
+            if m:
+                self.task_logger.debug("空间首页补抓到积分 -> %s" % m.group(1))
+                return int(m.group(1))
+            self.task_logger.warning("空间首页未找到「积分」字段")
+        except Exception as exc:  # noqa: BLE001
+            self.task_logger.warning("补抓积分失败: %r" % exc)
+        return None
+
     # ---------------------------------------------------------- 邮件
+
+    def build_mail_content(self, status=None):
+        """组装邮件 HTML 正文（独立出来便于本地预览与单元测试）。"""
+        if status is None:
+            status = "成功" if (self.logged_in and not self.fatal_error) else "异常"
+
+        fail_block = ""
+        if self.fatal_error:
+            fail_block = ("<p style='color:#c00;'><b>中断原因:</b> %s</p>"
+                          % self.fatal_error.replace("<", "&lt;"))
+
+        return (
+            "<h3>🎮 GameMale 每日自动化任务报告</h3>"
+            "<p>🔧 <b>运行模式:</b> %s | 🚪 <b>验证门:</b> %s | 📌 <b>总体:</b> %s</p>"
+            "%s"
+            "<p>🔑 <b>登录:</b> %s</p>"
+            "<p>📝 <b>核心签到:</b> %s</p>"
+            "<p>🎁 <b>日常抽奖:</b> %s</p>"
+            "<p>🤝 <b>互动作业:</b> %s</p>"
+            "<br><h4>📊 当前核心资产状态：</h4>"
+            "<pre style='background:#f4f4f4;padding:15px;border-radius:5px;"
+            "font-family:monospace;line-height:1.6;font-size:14px;'>%s</pre>"
+            "<br><small style='color:#888;'>报告由 GM-All-In-One %s 生成</small>"
+            % (self.run_mode, self.gate_mode, status, fail_block,
+               "成功" if self.logged_in else "失败",
+               self.sign_result, self.exchange_result, self.task_result,
+               self.assets_report.replace("<", "&lt;"), VERSION)
+        )
 
     def send_notification(self):
         smtp_host = env("GM_SMTP_HOST", "SMTP_HOST")
@@ -727,34 +1018,13 @@ class Gamemale:
         status = "成功" if (self.logged_in and not self.fatal_error) else "异常"
         self.notice_logger.info("发送推送邮件至 %s ..." % mail_to)
 
-        fail_block = ""
-        if self.fatal_error:
-            fail_block = ("<p style='color:#c00;'><b>中断原因:</b> %s</p>"
-                          % self.fatal_error.replace("<", "&lt;"))
-
-        mail_content = (
-            "<h3>GameMale 每日自动化任务报告</h3>"
-            "<p><b>运行模式:</b> %s | <b>验证门:</b> %s | <b>总体:</b> %s</p>"
-            "%s"
-            "<p><b>登录:</b> %s</p>"
-            "<p><b>核心签到:</b> %s</p>"
-            "<p><b>日常抽奖:</b> %s</p>"
-            "<p><b>互动作业:</b> %s</p>"
-            "<br><h4>当前核心资产状态：</h4>"
-            "<pre style='background:#f4f4f4;padding:15px;border-radius:5px;"
-            "font-family:monospace;line-height:1.6;font-size:14px;'>%s</pre>"
-            "<br><small style='color:#888;'>报告由 GM-All-In-One（修复版）生成</small>"
-            % (self.run_mode, self.gate_mode, status, fail_block,
-               "成功" if self.logged_in else "失败",
-               self.sign_result, self.exchange_result, self.task_result,
-               self.assets_report.replace("<", "&lt;"))
-        )
+        mail_content = self.build_mail_content(status)
 
         message = MIMEText(mail_content, "html", "utf-8")
         message["From"] = formataddr((Header("GM-Bot", "utf-8").encode(), mail_user))
         message["To"] = formataddr((Header("Master", "utf-8").encode(), mail_to))
         message["Subject"] = Header(
-            "GameMale 任务运行报告 - %s [%s]" % (status, self.sign_result), "utf-8")
+            "🎮 GameMale 任务运行报告 - %s [%s]" % (status, self.sign_result), "utf-8")
         try:
             server = smtplib.SMTP_SSL(smtp_host, 465, timeout=30)
             server.login(mail_user, mail_pass)
@@ -769,7 +1039,8 @@ class Gamemale:
     # ---------------------------------------------------------- 主流程
 
     def run(self, send_mail=True):
-        self.main_logger.info("=== GM-All-In-One 任务引擎启动（模式: %s）===" % self.run_mode)
+        self.main_logger.info("=== GM-All-In-One %s 任务引擎启动（模式: %s）==="
+                              % (VERSION, self.run_mode))
         ok = True
         try:
             if not self.connect():
@@ -808,12 +1079,31 @@ class Gamemale:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GameMale 论坛自动签到（修复版）")
+    parser = argparse.ArgumentParser(
+        description="GameMale 论坛自动签到 %s" % VERSION)
     parser.add_argument("--check", action="store_true",
                         help="自检模式：破门 + 登录 + 抓资产，不发邮件、不做写操作")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     parser.add_argument("--no-mail", action="store_true", help="本次不发邮件")
+    parser.add_argument("--reset-record", action="store_true",
+                        help="清空资产对比基准（克隆/复刻本仓库后，想让第一份报告是"
+                             "「首次记录」时用；不需要网络与账号）")
     args = parser.parse_args()
+
+    if args.reset_record:
+        removed = []
+        for path in (ASSET_RECORD_JSON, ASSET_RECORD_LEGACY):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                    removed.append(path)
+                except Exception as exc:  # noqa: BLE001
+                    print("删除 %s 失败: %r" % (path, exc))
+                    return 1
+        print("已清空资产对比基准: %s"
+              % (", ".join(removed) if removed else "（本来就没有，无需清空）"))
+        print("下次运行会全部显示「首次记录」，这是预期行为。")
+        return 0
 
     username = env("GM_USERNAME", "GM_USER", "USERNAME")
     password = env("GM_PASSWORD", "GM_PASS", "PASSWORD")
