@@ -151,14 +151,18 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -f gold_record.txt ]; then
-            git add gold_record.txt
-            if git diff --cached --quiet; then
-              echo "金币无变化，跳过提交"
-            else
-              git commit -m "chore: 自动更新每日金币对比基准文件"
-              git push || echo "!! push 失败：请检查 Settings -> Actions -> General -> Workflow permissions 是否为 Read and write"
-            fi
+          # v1.1 起基准文件是 asset_record.json（金币/血液/积分 + 日期）；
+          # 旧的纯数字 gold_record.txt 仍会被脚本读取（迁移期），一并纳入提交范围。
+          # 注意用 if 而不是 `[ -f ] && git add`：run 默认带 -e，
+          # 后者在文件不存在时会返回非零把整个 step 判失败。
+          for f in asset_record.json gold_record.txt; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "资产基准无变化，跳过提交"
+          else
+            git commit -m "chore: 自动更新资产对比基准（金币/血液/积分）"
+            git push || echo "!! push 失败：请检查 Settings -> Actions -> General -> Workflow permissions 是否为 Read and write"
           fi
 
       - name: Upload Debug Artifacts
