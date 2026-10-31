@@ -134,13 +134,21 @@ CHROME_UA = (
 )
 
 # 实测可通过插件的搜索引擎 UA（用于 classify 判定 + 破门失败时的降级只读）
+#
+# **顺序即优先级**，第一个是当前最可能通的。站点白名单是会变的，别指望写死一个 UA 长期有效：
+#   2026-09 之前：Baiduspider 最稳（整站放行，只有 misc.php 403）
+#   2026-10-31 起：Baiduspider / Googlebot / Sogou / 360Spider / Bytespider / YisouSpider /
+#                  Applebot 被「连上就断」（请求发出后 3 秒左右 RST，0 字节响应）；
+#                  未在白名单里的普通 bot UA（PetalBot / DuckDuckBot）反而会拿到验证门页面；
+#                  **只有 Bingbot 还能拿到真正的论坛页（HTTP 200 / 180KB）**。
+# 所以 Bingbot 排第一。真失效了也没关系：try_user_cookie() 会按这张表逐个试。
 SPIDER_UAS = [
+    ("Bingbot",
+     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"),
     ("Baiduspider",
      "Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)"),
     ("Googlebot",
      "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
-    ("Bingbot",
-     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"),
     ("Sogou",
      "Sogou web spider/4.0(+http://www.sogou.com/docs/help/webmasters.htm#07)"),
     ("360Spider",
@@ -1231,13 +1239,37 @@ return JSON.stringify(out);
 
     # -- 路线 A：用户自己的登录 Cookie（最稳，零浏览器）------------------
 
-    @staticmethod
-    def spider_ua():
-        """取蜘蛛 UA。可用 GM_SPIDER_UA 覆盖；默认 Baiduspider（实测最稳）。"""
-        custom = (os.getenv(SPIDER_UA_ENV) or "").strip()
-        if custom:
-            return custom
-        return dict(SPIDER_UAS)["Baiduspider"]
+    def _ua_candidates(self):
+        """
+        按「可信度」排序的候选爬虫 UA。
+
+        顺序：GM_SPIDER_UA（人工指定，最高优先）→ classify 实测命中的那个 →
+        SPIDER_UAS 内置顺序（目前 Bingbot 打头）。
+
+        为什么要一串而不是一个：站点随时会把某个 UA 拉黑（2026-10-31 就把 Baiduspider
+        拉黑过一次），写死单个 UA 的表现是「昨天还好好的，今天全红」，而且日志里
+        只会说 Cookie 失效，根本查不到原因。
+        """
+        seen, out = set(), []
+
+        def add(name, ua):
+            ua = (ua or "").strip()
+            if not ua or ua in seen:
+                return
+            seen.add(ua)
+            out.append((name, ua))
+
+        add("GM_SPIDER_UA", os.getenv(SPIDER_UA_ENV))
+        if self.spider_ua_name:
+            add(self.spider_ua_name, dict(SPIDER_UAS).get(self.spider_ua_name))
+        for name, ua in SPIDER_UAS:
+            add(name, ua)
+        return out
+
+    def spider_ua(self):
+        """当前默认蜘蛛 UA。可用 GM_SPIDER_UA 覆盖；否则取候选表第一位。"""
+        cands = self._ua_candidates()
+        return cands[0][1] if cands else CHROME_UA
 
     def try_user_cookie(self, http):
         """
@@ -1274,56 +1306,103 @@ return JSON.stringify(out);
                       "Cookie 里没有 `*_auth`（Discuz 登录凭据），"
                       "多半只复制了部分 Cookie，登录态可能不被识别")
 
-        ua = self.spider_ua()
+        # UA 不再写死：站点白名单会变（2026-10-31 就把 Baiduspider 拉黑了）。按候选顺序
+        # 逐个试，谁先拿到真正的论坛页就用谁，并把命中的 UA 记下来给后续请求复用。
         # 失败时必须把 UA 还原，否则会把「借来的蜘蛛 UA」留给后面的 classify，
         # 让 classify 误判成「OPEN —— 普通 UA 可直连」（这个坑实测踩到过）。
         orig_ua = http.user_agent
-
-        http.clear_cookies()
-        http.set_user_agent(ua)
-        http.set_cookies(cookies)
         http.set_referer(self.forum_url)
         self._log("info", "发现 %s（%d 项 Cookie），按「用户 Cookie 模式」直连"
                   % (USER_COOKIE_ENV, len(cookies)))
         self._log("debug", "Cookie 名单: %s" % ", ".join(sorted(cookies)))
 
         uid = None
+        winner = None
         gated = False
-        # 多取一个页面交叉验证，避免「某个页面没印 discuz_uid」被误判成 Cookie 失效
-        for path in ("/home.php?mod=spacecp", "/forum.php"):
-            try:
-                resp = http.get(self.url(path))
-            except Exception as exc:  # noqa: BLE001
-                self._log("warning", "用户 Cookie 验证请求异常（%s）: %r" % (path, exc))
-                continue
-            body = resp.text or ""
-            if is_gated(body):
-                gated = True
-                continue
-            uid = detect_uid(body)
-            if uid:
-                break
+        responded_total = 0     # 收到过 HTTP 响应的次数（不管内容是什么）
+        last_exc = None
 
-        if gated and not uid:
-            self.user_cookie_state = "gated"
-            self._log("warning",
-                      "用户 Cookie 模式下仍被拦门 —— 说明 GM_SPIDER_UA 这个 UA "
-                      "不在站点白名单里（请勿随意改它）")
+        for name, ua in self._ua_candidates():
             http.clear_cookies()
-            http.set_user_agent(orig_ua)
-            return False
+            http.set_user_agent(ua)
+            http.set_cookies(cookies)
+
+            ua_uid = None
+            ua_gated = False
+            ua_responded = 0
+            # 多取一个页面交叉验证，避免「某个页面没印 discuz_uid」被误判成 Cookie 失效
+            for path in ("/home.php?mod=spacecp", "/forum.php"):
+                try:
+                    resp = http.get(self.url(path))
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    self._log("warning", "用户 Cookie 验证请求异常（UA=%s, %s）: %r"
+                              % (name, path, exc))
+                    continue
+                ua_responded += 1
+                body = resp.text or ""
+                if is_gated(body):
+                    ua_gated = True
+                    continue
+                ua_uid = detect_uid(body)
+                if ua_uid:
+                    break
+
+            responded_total += ua_responded
+            gated = gated or ua_gated
+            if ua_uid:
+                uid, winner = ua_uid, name
+                break
+            if ua_responded and not ua_gated:
+                # 拿到的是真页面却没有 discuz_uid —— 这是登录态问题，换 UA 也没用
+                self._log("debug", "UA %s 能拿到页面但读不到 uid，判定为登录态问题" % name)
+                break
+            if ua_responded:
+                self._log("info", "UA %s 被验证门拦住，换下一个候选" % name)
+            else:
+                self._log("info", "UA %s 被站点直接断开（0 字节响应），换下一个候选" % name)
 
         if uid:
+            self.spider_ua_name = winner
             self.user_cookie_state = "ok"
-            self._log("info", "用户 Cookie 有效，已登录 uid=%d —— 跳过浏览器与验证码" % uid)
+            self._log("info", "用户 Cookie 有效，已登录 uid=%d（UA=%s）—— 跳过浏览器与验证码"
+                      % (uid, winner))
             self.state = OPEN
             self.gate_mode = USER_COOKIE_MODE
             self.logged_uid = uid
             return True   # 成功时保留蜘蛛 UA（后续请求都要用它）
 
+        # 一个响应都没收到 —— 这是网络/站点不可达，**绝不能报成 Cookie 失效**。
+        # 2026-10-31 那次「登录已失效」的误报就是这么来的：两次请求都 Timeout，
+        # 循环 continue 后 uid 为 None，直接落到 expired 分支，用户白折腾一晚换 Cookie。
+        if responded_total == 0:
+            self.user_cookie_state = "unreachable"
+            self._log("error",
+                      "站点不可达：%d 个候选 UA 全部连接失败（最后一次异常：%r）。"
+                      "**这不代表 Cookie 失效** —— 是网络或站点侧的问题。"
+                      % (len(self._ua_candidates()), last_exc))
+            self._log("error",
+                      "排查顺序：① 等几分钟重跑（站点会间歇性抽风）；"
+                      "② 用浏览器打开 https://%s/ 看能不能正常进站；"
+                      "③ 换一个 UA 试试（Secrets 里加 %s，值是完整的一行 UA）。"
+                      % (self.hostname, SPIDER_UA_ENV))
+            http.clear_cookies()
+            http.set_user_agent(orig_ua)
+            return False
+
+        if gated:
+            self.user_cookie_state = "gated"
+            self._log("warning",
+                      "用户 Cookie 模式下仍被拦门 —— 候选表里的 UA 都不在站点白名单里了。"
+                      "站点大概率又改了放行规则，请更新 SPIDER_UAS 或用 %s 指定一个新 UA"
+                      % SPIDER_UA_ENV)
+            http.clear_cookies()
+            http.set_user_agent(orig_ua)
+            return False
+
         self.user_cookie_state = "expired"
         self._log("error",
-                  "用户 Cookie 已失效（服务端认为未登录，指纹=%s）。"
+                  "用户 Cookie 已失效（站点确实返回了页面，但里面是游客身份，指纹=%s）。"
                   "请重新在浏览器登录 %s 后复制新的 Cookie 串，更新仓库 Secret %s"
                   % (fp, self.hostname, USER_COOKIE_ENV))
         http.clear_cookies()
@@ -1375,11 +1454,20 @@ return JSON.stringify(out);
             return USER_COOKIE_MODE
 
         # 配了却不能用 —— 必须立刻停，否则会白烧几分钟去开浏览器，最后给一个看不懂的报错
+        if self.user_cookie_state == "unreachable":
+            raise GateError(
+                "站点不可达：所有候选爬虫 UA 都连不上 %s。\n"
+                "  这是**网络/站点侧的问题，不是 Cookie 失效**，先别去换 Cookie。\n"
+                "  处理：① 过几分钟重跑（站点会间歇性抽风）；"
+                "② 浏览器打开 https://%s/ 确认站点本身正常；"
+                "③ 站点改了放行规则就用 Secrets 里的 %s 指定新 UA。"
+                % (self.hostname, self.hostname, SPIDER_UA_ENV))
+
         if self.user_cookie_state in ("broken", "expired", "gated"):
             reason = {
                 "broken": "内容解析不出任何 Cookie（多半是粘贴时截断了）",
-                "expired": "Cookie 已失效（服务端认为未登录，通常是超过约 30 天或改了密码）",
-                "gated": "带上它仍被拦门（GM_SPIDER_UA 被改动过？）",
+                "expired": "Cookie 已失效（站点返回的是游客身份，通常是超过约 30 天或改了密码）",
+                "gated": "带上它仍被拦门（候选 UA 都不在白名单里了，站点又改了规则）",
             }[self.user_cookie_state]
             raise GateError(
                 "%s 已配置但不可用：%s\n"
@@ -1654,9 +1742,11 @@ def main():
         print("\n[门口状态] 路线A 用户 Cookie —— 已是登录态（uid=%s），跳过 Turnstile 与验证码"
               % gate.logged_uid)
         how = "用户 Cookie（%s）" % USER_COOKIE_ENV
-    elif gate.user_cookie_state in ("broken", "expired", "gated"):
+    elif gate.user_cookie_state in ("broken", "expired", "gated", "unreachable"):
         print("\n[门口状态] 路线A 失败：%s 已配置但不可用（状态=%s）"
               % (USER_COOKIE_ENV, gate.user_cookie_state))
+        if gate.user_cookie_state == "unreachable":
+            print("  ⚠ 状态是 unreachable：这是连不上站点，不是 Cookie 过期 —— 别急着重新取 Cookie")
     elif gate.try_preset_cookie(http):
         print("\n[门口状态] 路线A' 过门 Cookie 有效（%s）" % COOKIE_ENV)
         how = "预置 Cookie（%s）" % COOKIE_ENV
