@@ -1,0 +1,79 @@
+name: 'Probe Signin Days'
+
+# 一次性探测：把 k_misign 签到页面上与「天数」有关的文本抓出来，
+# 用于在邮件里显示「连续签到 N 天」。用完即删。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Probe
+        env:
+          GM_USER_COOKIE: ${{ secrets.GM_USER_COOKIE }}
+          GM_SPIDER_UA: ${{ secrets.GM_SPIDER_UA }}
+          GM_BROWSER_ATTEMPTS: '1'
+          GM_SOLVE_TIMEOUT: '45'
+        run: |
+          python - <<'PY'
+          import logging, re, sys
+          sys.path.insert(0, '.')
+          from gm_gate import HttpEngine, GateKeeper, GatedSession
+
+          logging.basicConfig(level=logging.INFO, format='%(message)s')
+          log = logging.getLogger('probe')
+
+          host = 'www.gamemale.com'
+          http = HttpEngine(host, log)
+          gate = GateKeeper(host, log, browser_path=None)
+          sess = GatedSession(http, gate, log)
+          mode = gate.ensure_access(http)
+          log.info('GATE MODE = %s' % mode)
+
+          base = 'https://%s' % host
+          text = sess.get(base + '/forum.php').text or ''
+          m = re.search(r'<input type="hidden" name="formhash" value="(.+?)"', text)
+          fh = m.group(1) if m else ''
+          log.info('FORMHASH = %s' % (fh or '(none)'))
+
+          targets = [
+              '/k_misign-sign.html',
+              '/k_misign-sign.html?operation=qiandao&format=button&formhash=' + fh,
+              '/plugin.php?id=k_misign:sign',
+              '/space-uid-%s.html' % (getattr(gate, 'logged_uid', '') or ''),
+          ]
+          for t in targets:
+              try:
+                  r = sess.get(base + t)
+              except Exception as e:
+                  log.info('=== %s -> EXC %r' % (t, e))
+                  continue
+              body = r.text or ''
+              log.info('=== %s -> %s / %d bytes' % (t, r.status_code, len(body)))
+              # 抓所有含「签」的纯文本片段
+              hits = re.findall(r'[^<>]{0,45}签[^<>]{0,45}', body)
+              seen = set()
+              for h in hits[:25]:
+                  h = h.strip()
+                  if h and h not in seen:
+                      seen.add(h)
+                      log.info('    | %s' % h)
+              # 顺便找数字+天的组合
+              for h in re.findall(r'[^<>]{0,30}\d+\s*天[^<>]{0,30}', body)[:8]:
+                  log.info('   D | %s' % h.strip())
+          PY
