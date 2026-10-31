@@ -129,7 +129,7 @@ ASSET_ITEMS = ["金币", "血液", "旅程", "追随", "知识", "咒术", "堕�
 # 需要做「较上次」对比的项
 TRACKED_ITEMS = ["金币", "血液", "积分"]
 
-VERSION = "v1.1"
+VERSION = "v1.3"
 
 # ---- 等级门槛（下标即为等级号）----
 # 用户提供：lv0-0 lv1-3 lv2-10 lv3-35 lv4-? lv5-120 lv6-200 lv7-300 lv8-450 lv9-650 lv10-900
@@ -392,6 +392,12 @@ class Gamemale:
         self.my_uid = None         # 本账号 uid（页面里读到就记下），用于基准文件归属校验
 
         self.sign_result = "未执行"
+        # 签到面板上的四个数字（k_misign 插件用数字图片渲染，纯文本读不到，
+        # 只能从隐藏 input 里取）。抓不到就是 None，邮件里自动省略这一段。
+        self.sign_streak = None    # 连续签到天数  id="lxdays"
+        self.sign_total = None     # 累计签到天数  id="lxtdays"
+        self.sign_level = None     # 签到等级      id="lxlevel"
+        self.sign_rank = None      # 签到排名      id="qiandaobtnnum"
         self.exchange_result = "未执行"
         self.task_result = "未执行"
         self.assets_report = "未抓取"
@@ -703,6 +709,7 @@ class Gamemale:
         if not self.post_formhash:
             self.sign_result = "失败：缺少 formhash"
             self.sign_logger.error(self.sign_result)
+            self.fetch_sign_stats()
             return
         url = self._url("/k_misign-sign.html?operation=qiandao&format=button&formhash=%s"
                         % self.post_formhash)
@@ -720,6 +727,55 @@ class Gamemale:
         except Exception as exc:  # noqa: BLE001
             self.sign_result = "异常: %r" % exc
             self.sign_logger.error("签到异常: %r" % exc)
+        # 放在「签到动作之后」抓，才算上今天这一天
+        self.fetch_sign_stats()
+
+    def fetch_sign_stats(self):
+        """抓签到面板的连续天数 / 累计天数 / 等级 / 排名。
+
+        这几个数字在页面上是**数字图片**渲染的 —— `<b class="pics"><span class="three">
+        <span class="nine"></span></b>` 就是「39」，纯文本里根本读不到。
+        真值藏在同一行的隐藏 input 里，只能从这里取：
+
+            <input type="hidden" class="hidnum" id="lxdays"       value="39">
+            <input type="hidden" class="hidnum" id="lxtdays"      value="92">
+            <input type="hidden" class="hidnum" id="lxlevel"      value="7">
+            <input type="hidden" class="hidnum" id="qiandaobtnnum" value="1985">
+
+        必须在签到动作之后调用，否则拿到的是截止到昨天的天数。
+        任何异常都只表现为「邮件里少一行」，绝不影响签到本身。
+        """
+        try:
+            body = self.sess.get(self._url("/k_misign-sign.html")).text or ""
+        except Exception as exc:  # noqa: BLE001
+            self.sign_logger.warning("抓签到天数失败（不影响签到）: %r" % exc)
+            return
+
+        def pick(field):
+            tag = re.search(r'<input[^>]*id="%s"[^>]*>' % field, body)
+            if not tag:
+                return None
+            val = re.search(r'value="(\d{1,7})"', tag.group(0))
+            return int(val.group(1)) if val else None
+
+        self.sign_streak = pick("lxdays")
+        self.sign_total = pick("lxtdays")
+        self.sign_level = pick("lxlevel")
+        self.sign_rank = pick("qiandaobtnnum")
+
+        if self.sign_streak is None:
+            self.sign_logger.warning("签到面板里没找到连续天数（页面 %d 字节），"
+                                     "站点可能改了插件结构" % len(body))
+            return
+
+        bits = ["连续 %d 天" % self.sign_streak]
+        if self.sign_total is not None:
+            bits.append("累计 %d 天" % self.sign_total)
+        if self.sign_level is not None:
+            bits.append("Lv.%d" % self.sign_level)
+        if self.sign_rank is not None:
+            bits.append("今日排名 %d" % self.sign_rank)
+        self.sign_logger.info("签到统计: %s" % " | ".join(bits))
 
     # ---------------------------------------------------------- 抽奖
 
@@ -1071,6 +1127,22 @@ class Gamemale:
 
     # ---------------------------------------------------------- 邮件
 
+    def sign_streak_text(self, compact=False):
+        """把签到统计拼成一句话；抓不到就返回空串，调用方直接拼不会多出分隔符。"""
+        if self.sign_streak is None:
+            return ""
+        if compact:
+            return " · 连签 %d 天" % self.sign_streak
+        bits = []
+        if self.sign_total is not None:
+            bits.append("累计 %d 天" % self.sign_total)
+        if self.sign_level is not None:
+            bits.append("签到 Lv.%d" % self.sign_level)
+        if self.sign_rank is not None:
+            bits.append("今日排名 %d" % self.sign_rank)
+        tail = "（%s）" % " · ".join(bits) if bits else ""
+        return "　|　🔥 <b>连续签到 %d 天</b>%s" % (self.sign_streak, tail)
+
     def build_mail_content(self, status=None):
         """组装邮件 HTML 正文（独立出来便于本地预览与单元测试）。"""
         if status is None:
@@ -1086,7 +1158,7 @@ class Gamemale:
             "<p>🔧 <b>运行模式:</b> %s | 🚪 <b>验证门:</b> %s | 📌 <b>总体:</b> %s</p>"
             "%s"
             "<p>🔑 <b>登录:</b> %s</p>"
-            "<p>📝 <b>核心签到:</b> %s</p>"
+            "<p>📝 <b>核心签到:</b> %s%s</p>"
             "<p>🎁 <b>日常抽奖:</b> %s</p>"
             "<p>🤝 <b>互动作业:</b> %s</p>"
             "<br><h4>📊 当前核心资产状态：</h4>"
@@ -1095,7 +1167,8 @@ class Gamemale:
             "<br><small style='color:#888;'>报告由 GM-All-In-One %s 生成</small>"
             % (self.run_mode, self.gate_mode, status, fail_block,
                "成功" if self.logged_in else "失败",
-               self.sign_result, self.exchange_result, self.task_result,
+               self.sign_result, self.sign_streak_text(),
+               self.exchange_result, self.task_result,
                self.assets_report.replace("<", "&lt;"), VERSION)
         )
 
@@ -1118,7 +1191,8 @@ class Gamemale:
         message["From"] = formataddr((Header("GM-Bot", "utf-8").encode(), mail_user))
         message["To"] = formataddr((Header("Master", "utf-8").encode(), mail_to))
         message["Subject"] = Header(
-            "🎮 GameMale 任务运行报告 - %s [%s]" % (status, self.sign_result), "utf-8")
+            "🎮 GameMale 任务运行报告 - %s [%s%s]"
+            % (status, self.sign_result, self.sign_streak_text(compact=True)), "utf-8")
         try:
             server = smtplib.SMTP_SSL(smtp_host, 465, timeout=30)
             server.login(mail_user, mail_pass)
@@ -1149,7 +1223,10 @@ class Gamemale:
                         "（因此不会触碰被 403 封死的 %s）"
                         % ", ".join(SPIDER_BLOCKED_PATHS))
                 if self.run_mode in ("light", "check"):
-                    self.main_logger.info("%s 模式：跳过签到/抽奖/互动，仅抓取资产" % self.run_mode)
+                    self.main_logger.info("%s 模式：跳过签到/抽奖/互动，仅抓取资产与签到统计"
+                                          % self.run_mode)
+                    # 不签到，但面板照读 —— 这样 light 模式发的邮件里也有「连续 N 天」
+                    self.fetch_sign_stats()
                 else:
                     self.sign_gamemale()
                     self.daily_exchange()
