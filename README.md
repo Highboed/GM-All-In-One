@@ -340,6 +340,40 @@ python gamemale.py --reset-record    # 不需要账号密码、不联网
 
 ---
 
+### 第八步：以后上游修了 bug，我怎么更新？
+
+代码是写在你**自己的仓库**里的，上游改了不会自动同步过来。2026-10-31 就出过一次这种事：
+论坛把老爬虫 UA 拉黑了，脚本却报「用户 Cookie 已失效」，所有人的定时任务同时全红，
+还会误导你去重新抓 Cookie —— 其实 Cookie 一点问题都没有。
+
+现在主仓库自带一个 **Sync Upstream Code** 工作流：
+
+| 它做什么 | 它不做什么 |
+| :-- | :-- |
+| 每周一 11:00 把上游的 `gm_gate.py` / `gamemale.py` / `get_user_cookie.py` / `requirements.txt` 拉过来覆盖 | **不碰任何 Secret** —— 账号密码、Cookie、邮箱一个都不会动 |
+| 想立刻更新：Actions → 左侧 **Sync Upstream Code** → `Run workflow` | **不碰 `signin.yml`** —— 你改过的定时时间不会被冲掉 |
+| 上游 `signin.yml` 有变化时，日志里给你一条 notice 提醒 | 不碰 `README.md` / 资产记录 / 你的任何其他文件 |
+
+> ⚠️ **如果你的仓库是 2026-10-31 之前部署的，里面还没有这个文件。** 手动补一次，之后就能自动跟进：
+>
+> 1. 打开你的仓库 → 右上 `Add file` → `Create new file`
+> 2. 文件名填 `.github/workflows/sync-upstream.yml`（输入 `/` 会自动建目录）
+> 3. 打开[上游的这个文件](https://github.com/Highboed/GM-All-In-One/blob/main/.github/workflows/sync-upstream.yml)，
+>    点右上角 **Raw** → 全选复制 → 粘进编辑器
+> 4. 底部 `Commit changes`
+> 5. 进 **Actions** → 左侧点 **Sync Upstream Code** → `Run workflow`
+>
+> 一两分钟代码就是最新版了，之后每周自动跟进，不用再管。
+
+> 实在嫌麻烦：`Settings` → 拉到最下面 `Delete this repository` 删掉，再用扩展**重新一键部署**一次。
+> Secrets 会重建、资产基准会重置（无害，只是第一次显示「首次记录」），但能一次性拿到全部最新文件。
+
+> **怎么判断自己是不是中招了？** 看最近一次失败的日志，如果里面是
+> `Timeout (... 30000 milliseconds with 0 bytes received)` 之后紧跟 `用户 Cookie 已失效`，
+> 那就是这个 bug，**别去动 Cookie**，按上面更新代码就行。
+
+---
+
 ## ✨ 它到底能干什么？ (功能特性)
 
 本脚本全面摒弃了模拟浏览器的慢速方案，所有操作直接对接论坛底层 API，执行速度极快且稳定：
@@ -355,6 +389,17 @@ python gamemale.py --reset-record    # 不需要账号密码、不联网
 ---
 
 ## 🆕 更新记录
+
+### v1.2.6（2026-10-31）· 站点反爬策略变化 + 上游自动同步
+
+| # | 变化 | 说明 |
+| :-- | :-- | :-- |
+| 1 | **爬虫 UA 改为候选链** | 论坛 10-31 起只放行 Bingbot 等极少数 UA，老的 Baiduspider 会「连上就断」。现在按 `GM_SPIDER_UA` → 实测命中 → 内置候选表逐个试，Bingbot 打头 |
+| 2 | **失败原因不再撒谎** | 以前网络超时会被判成「Cookie 已失效」，害你白换 Cookie。现在区分 `unreachable` / `expired` / `gated` 三态 |
+| 3 | **`GM_SPIDER_UA` 真正生效** | `signin.yml` 三处 env 补上映射（以前 Secret 设了也没用），站点再拉黑 UA 时改 Secret 即可热切换，不用改代码 |
+| 4 | **新增 Sync Upstream Code** | 每周一自动从上游拉取代码文件覆盖，Secrets 与定时配置不受影响。详见「第八步」 |
+
+> 10-31 当晚 #306 / #307 两次失败的根因就是 #1 + #2 的组合，与你的 Cookie 无关。
 
 ### v1.2.5（2026-09-25）· 部署体验
 
