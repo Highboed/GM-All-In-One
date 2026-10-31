@@ -1,0 +1,85 @@
+name: 'Sync Upstream Code'
+
+# 上游修了 bug，你不必手改代码：这个工作流会定期把上游的「代码文件」拉过来覆盖。
+#
+# 刻意不碰的东西：
+#   * .github/workflows/signin.yml —— 里面可能有你改过的定时时间/开关，覆盖会丢。
+#     它真需要更新时，日志里会给你一条 notice 提醒，你自己决定。
+#   * README.md / asset_record.json / gold_record.txt —— 属于你的仓库，不是公共代码
+#   * Secrets —— 工作流完全接触不到，永远不会被改
+#
+# 想立刻拿最新代码：Actions → Sync Upstream Code → Run workflow
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # 每周一 03:00 UTC = 北京时间 11:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gm-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Highboed/GM-All-In-One
+  BRANCH: main
+  # 只同步「代码」。加文件请一并加到这一行。
+  FILES: 'gm_gate.py gamemale.py get_user_cookie.py requirements.txt'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: 拉取上游代码
+        run: |
+          set -uo pipefail
+          changed=0
+          for f in $FILES; do
+            tmp="$(mktemp)"
+            if curl -fsSL --retry 3 --retry-delay 2 \
+                 "https://raw.githubusercontent.com/$UPSTREAM/$BRANCH/$f" -o "$tmp"; then
+              if [ -f "$f" ] && cmp -s "$tmp" "$f"; then
+                echo "= $f 已是最新"
+              else
+                mv "$tmp" "$f"
+                echo "! $f 已更新"
+                changed=1
+              fi
+            else
+              echo "::warning::拉取 $f 失败，本次跳过"
+            fi
+            rm -f "$tmp"
+          done
+          echo "CHANGED=$changed" >> "$GITHUB_ENV"
+
+      - name: 检查 signin.yml 是否有上游更新（只提醒，不覆盖）
+        run: |
+          url="https://raw.githubusercontent.com/$UPSTREAM/$BRANCH/.github/workflows/signin.yml"
+          if curl -fsSL --retry 3 "$url" -o /tmp/up_signin.yml; then
+            if cmp -s /tmp/up_signin.yml .github/workflows/signin.yml; then
+              echo "signin.yml 与上游一致"
+            else
+              echo "::notice title=signin.yml 可以更新::上游的 signin.yml 和你仓库里的不一样。本次刻意没有覆盖，怕冲掉你改过的定时时间。如果你的定时没改过，去上游复制一份替换即可。"
+            fi
+          else
+            echo "::warning::拿不到上游 signin.yml，跳过比对"
+          fi
+
+      - name: 提交并推送
+        if: env.CHANGED == '1'
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "chore: 同步上游代码 $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: 无需更新
+        if: env.CHANGED != '1'
+        run: echo "代码已是最新，没有提交"
