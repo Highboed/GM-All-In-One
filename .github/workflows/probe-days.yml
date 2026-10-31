@@ -42,38 +42,36 @@ jobs:
           http = HttpEngine(host, log)
           gate = GateKeeper(host, log, browser_path=None)
           sess = GatedSession(http, gate, log)
-          mode = gate.ensure_access(http)
-          log.info('GATE MODE = %s' % mode)
+          log.info('GATE MODE = %s' % gate.ensure_access(http))
 
           base = 'https://%s' % host
-          text = sess.get(base + '/forum.php').text or ''
-          m = re.search(r'<input type="hidden" name="formhash" value="(.+?)"', text)
-          fh = m.group(1) if m else ''
-          log.info('FORMHASH = %s' % (fh or '(none)'))
+          body = sess.get(base + '/k_misign-sign.html').text or ''
+          log.info('PAGE = %d bytes' % len(body))
 
-          targets = [
-              '/k_misign-sign.html',
-              '/k_misign-sign.html?operation=qiandao&format=button&formhash=' + fh,
-              '/plugin.php?id=k_misign:sign',
-              '/space-uid-%s.html' % (getattr(gate, 'logged_uid', '') or ''),
-          ]
-          for t in targets:
-              try:
-                  r = sess.get(base + t)
-              except Exception as e:
-                  log.info('=== %s -> EXC %r' % (t, e))
-                  continue
-              body = r.text or ''
-              log.info('=== %s -> %s / %d bytes' % (t, r.status_code, len(body)))
-              # 抓所有含「签」的纯文本片段
-              hits = re.findall(r'[^<>]{0,45}签[^<>]{0,45}', body)
-              seen = set()
-              for h in hits[:25]:
-                  h = h.strip()
-                  if h and h not in seen:
-                      seen.add(h)
-                      log.info('    | %s' % h)
-              # 顺便找数字+天的组合
-              for h in re.findall(r'[^<>]{0,30}\d+\s*天[^<>]{0,30}', body)[:8]:
-                  log.info('   D | %s' % h.strip())
+          def ctx(kw, pad=500, tag='CTX'):
+              i = body.find(kw)
+              if i < 0:
+                  log.info('%s [%s] NOT FOUND' % (tag, kw))
+                  return
+              seg = body[max(0, i - pad): i + pad]
+              seg = re.sub(r'\s+', ' ', seg)
+              log.info('%s [%s] %s' % (tag, kw, seg))
+
+          ctx('连续签到', 600)
+          ctx('签到排名', 350)
+          ctx('签到等级', 350)
+
+          # 所有 id/class 里带 misign 的容器起始标签，看结构
+          for m in re.findall(r'<(?:div|ul|li|p|span|em|strong|a)[^>]{0,180}(?:misign|qiandao|sign)[^>]{0,180}>', body)[:15]:
+              log.info('TAG %s' % re.sub(r'\s+', ' ', m)[:200])
+
+          # 「天」字前后 60 字符的原文（不去标签），看数字是否在独立节点
+          for m in re.findall(r'.{60}天.{60}', re.sub(r'\s+', ' ', body))[:10]:
+              log.info('DAY %s' % m)
+
+          # 已签到时的接口原文
+          fm = re.search(r'name="formhash" value="(.+?)"', sess.get(base + '/forum.php').text or '')
+          fh = fm.group(1) if fm else ''
+          r = sess.get(base + '/k_misign-sign.html?operation=qiandao&format=button&formhash=' + fh)
+          log.info('API = %r' % (r.text or '')[:300])
           PY
