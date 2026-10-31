@@ -129,7 +129,12 @@ ASSET_ITEMS = ["金币", "血液", "旅程", "追随", "知识", "咒术", "堕�
 # 需要做「较上次」对比的项
 TRACKED_ITEMS = ["金币", "血液", "积分"]
 
-VERSION = "v1.3"
+VERSION = "v1.4"
+
+# ---- 运行模式的中文名 ----
+# 邮件里不再出现「未执行」这三个字 —— 看到它容易以为出了故障，
+# 其实往往只是当前模式本来就不做那一步。直接写出模式名，一眼就知道是哪种执行。
+MODE_LABEL = {"full": "全部执行", "light": "轻量执行", "check": "检查执行"}
 
 # ---- 等级门槛（下标即为等级号）----
 # 用户提供：lv0-0 lv1-3 lv2-10 lv3-35 lv4-? lv5-120 lv6-200 lv7-300 lv8-450 lv9-650 lv10-900
@@ -1127,6 +1132,25 @@ class Gamemale:
 
     # ---------------------------------------------------------- 邮件
 
+    @property
+    def mode_label(self):
+        """运行模式的中文名：全部执行 / 轻量执行 / 检查执行。"""
+        return MODE_LABEL.get(self.run_mode, self.run_mode)
+
+    def headline(self):
+        """邮件标题里的状态词。
+
+        轻量 / 检查模式直接把模式名摆出来（「轻量执行」），
+        全量模式则显示真实的签到结果（「今日已签到」）。
+        这样标题里永远不会出现让人心里一紧的「未执行」；
+        真的中断了也写「中止」，而不是留一个含义模糊的「未执行」。
+        """
+        if self.run_mode in ("light", "check"):
+            return self.mode_label
+        if self.fatal_error and self.sign_result == "未执行":
+            return "中止"
+        return self.sign_result
+
     def sign_streak_text(self, compact=False):
         """把签到统计拼成一句话；抓不到就返回空串，调用方直接拼不会多出分隔符。"""
         if self.sign_streak is None:
@@ -1165,7 +1189,8 @@ class Gamemale:
             "<pre style='background:#f4f4f4;padding:15px;border-radius:5px;"
             "font-family:monospace;line-height:1.6;font-size:14px;'>%s</pre>"
             "<br><small style='color:#888;'>报告由 GM-All-In-One %s 生成</small>"
-            % (self.run_mode, self.gate_mode, status, fail_block,
+            % ("%s（%s）" % (self.mode_label, self.run_mode),
+               self.gate_mode, status, fail_block,
                "成功" if self.logged_in else "失败",
                self.sign_result, self.sign_streak_text(),
                self.exchange_result, self.task_result,
@@ -1192,7 +1217,7 @@ class Gamemale:
         message["To"] = formataddr((Header("Master", "utf-8").encode(), mail_to))
         message["Subject"] = Header(
             "🎮 GameMale 任务运行报告 - %s [%s%s]"
-            % (status, self.sign_result, self.sign_streak_text(compact=True)), "utf-8")
+            % (status, self.headline(), self.sign_streak_text(compact=True)), "utf-8")
         try:
             server = smtplib.SMTP_SSL(smtp_host, 465, timeout=30)
             server.login(mail_user, mail_pass)
@@ -1223,8 +1248,14 @@ class Gamemale:
                         "（因此不会触碰被 403 封死的 %s）"
                         % ", ".join(SPIDER_BLOCKED_PATHS))
                 if self.run_mode in ("light", "check"):
-                    self.main_logger.info("%s 模式：跳过签到/抽奖/互动，仅抓取资产与签到统计"
-                                          % self.run_mode)
+                    self.main_logger.info(
+                        "%s 模式：跳过签到/抽奖/互动，仅抓取资产与签到统计"
+                        % self.mode_label)
+                    # 明确写出「这一步本次没做」，而不是留「未执行」——
+                    # 后者看起来像出错，实际上只是模式如此。
+                    self.sign_result = "%s（本次未签到）" % self.mode_label
+                    self.exchange_result = "%s（本次跳过）" % self.mode_label
+                    self.task_result = "%s（本次跳过）" % self.mode_label
                     # 不签到，但面板照读 —— 这样 light 模式发的邮件里也有「连续 N 天」
                     self.fetch_sign_stats()
                 else:
