@@ -98,6 +98,9 @@ jobs:
         env:
           GM_USER_COOKIE: ${{ secrets.GM_USER_COOKIE }}
           GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
+          # 站点会把爬虫 UA 拉黑（2026-10-31 拉黑过 Baiduspider）。这里允许用 Secret
+          # 临时换 UA，不必改代码重新发版；不配则用脚本内置候选表（当前首选 Bingbot）。
+          GM_SPIDER_UA: ${{ secrets.GM_SPIDER_UA }}
         run: |
           set -o pipefail
           python gm_gate.py --no-browser 2>&1 | tee preflight.txt
@@ -107,6 +110,7 @@ jobs:
         # 没配则只给一条 warning annotation，不阻塞（脚本会自己走浏览器兜底）。
         env:
           GM_USER_COOKIE: ${{ secrets.GM_USER_COOKIE }}
+          GM_SPIDER_UA: ${{ secrets.GM_SPIDER_UA }}
         run: |
           set -o pipefail
           if [ -z "$GM_USER_COOKIE" ]; then
@@ -137,6 +141,8 @@ jobs:
           CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
           # 【路线 C 的加速缓存】本地破门一次导出的放行 Cookie（寿命很短，仅作可选优化）
           GM_GATE_COOKIE: ${{ secrets.GM_GATE_COOKIE }}
+          # 爬虫 UA 可覆盖（站点会拉黑 UA；不配则用内置候选表，当前首选 Bingbot）
+          GM_SPIDER_UA: ${{ secrets.GM_SPIDER_UA }}
           # 浏览器兜底的成本必须压住：上游默认 3 次 × 90 秒 ≈ 5 分钟。
           # 实测它「能过但不稳」（2026-09-23 有过一次 idle->interaction_required->点击->通过的完整成功），
           # 所以保留 1 次机会；1 次 × 75 秒足够走完「加载 -> 点击 -> 通过」，
