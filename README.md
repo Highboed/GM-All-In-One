@@ -32,7 +32,7 @@
 3. 点 **加载已解压的扩展程序**，选中刚才解压出来的那个文件夹。
 4. 装好后点扩展图标，面板长这样：
 
-<img width="382" alt="扩展面板" src="docs/images/popup.png" />
+<img width="422" alt="扩展面板" src="docs/images/popup.png" />
 
 > 想把 Cookie 写进**已经存在**的仓库（而不是新建一个）也可以，面板里的「高级设置」就是为这种情况准备的。
 
@@ -42,7 +42,7 @@
 
 扩展会自动读到登录 Cookie，面板的「登录状态」变成**已登录**、并算出 12 位指纹，就说明拿到手了：
 
-<img width="720" alt="Cookie 已读取" src="docs/images/step1-cookie.png" />
+<img width="760" alt="Cookie 已读取" src="docs/images/step1-cookie.png" />
 
 > **为什么这一下就够了？** 本站挂了人机验证插件，但它把搜索引擎爬虫 UA 整站放行。
 > 于是「你浏览器的登录 Cookie + 爬虫 UA」就能完全绕开验证 —— 前提是 Cookie 得由真浏览器产生，
@@ -52,7 +52,7 @@
 
 点扩展面板顶部的 **打开一键部署向导**，按页面上的 1→2→3→4 走：
 
-<img width="720" alt="部署配置" src="docs/images/step2-config.png" />
+<img width="760" alt="部署配置" src="docs/images/step2-config.png" />
 
 - **站点登录**：扩展自动完成（第二步做过就是绿的）。
 - **GitHub 授权**：点「去创建 Token」会带着正确的权限范围打开 GitHub 页面，创建后粘回来。Token 只存在这个页面内存里，刷新即清空。
@@ -61,7 +61,7 @@
 
 点 **开始一键部署**，日志会一条条滚过去；最后一步要等 GitHub 建运行记录，页面有进度条，**最长等 2 分钟**：
 
-<img width="720" alt="执行与结果" src="docs/images/step3-run.png" />
+<img width="760" alt="执行与结果" src="docs/images/step3-run.png" />
 
 看到绿色那一段就成了。**约 1~2 分钟后报告邮件到邮箱**（没收到先翻垃圾箱）。
 
