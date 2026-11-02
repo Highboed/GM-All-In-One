@@ -27,9 +27,18 @@
 
 ### 第一步：装载扩展
 
+**用 Edge 的话，商店一键安装最省事：**
+
+**[GM Cookie Helper · Edge 加载项](https://microsoftedge.microsoft.com/addons/detail/gm-cookie-helper/pegdimdebbompdnlgeaagfpbfpihogfb)** —— 点「获取」确认即可，之后自动更新。
+
+**用 Chrome 或其他 Chromium 浏览器**（Brave / Vivaldi / Opera 等）需要手动加载：
+
 1. 下载 **[gm-cookie-helper.zip](https://github.com/Highboed/GM-All-In-One/releases/latest/download/gm-cookie-helper.zip)**，解压到一个固定目录（比如 `D:\GM-Cookie-Helper`，**别放在临时目录**，扩展加载后依赖这个路径）。
 2. 浏览器地址栏输入 `chrome://extensions`，打开右上角的 **开发者模式**。
 3. 点 **加载已解压的扩展程序**，选中刚才解压出来的那个文件夹。
+
+> 商店版和 zip 版是同一份代码，功能完全一致。区别只在更新方式：商店版自动更新，zip 版需要重新下载覆盖。
+
 4. 装好后点扩展图标，弹窗分 **部署 / Cookie / Secret** 三个标签，默认停在 **部署**：
 
 <img width="422" alt="弹窗 · 部署标签" src="docs/images/popup.png" />
